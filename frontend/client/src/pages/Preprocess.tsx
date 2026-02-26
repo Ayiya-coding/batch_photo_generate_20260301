@@ -1034,6 +1034,14 @@ export default function Preprocess() {
   );
 
   const successImages = images.filter((img) => img.status === "success");
+  const getMaskStatusAfterUpdate = useCallback(
+    (currentStatus: WatermarkStatus, hasMask: boolean): WatermarkStatus => {
+      if (hasMask) return "marked";
+      if (currentStatus === "done" || currentStatus === "failed") return currentStatus;
+      return "unmarked";
+    },
+    []
+  );
   const withCacheBust = useCallback((url: string) => {
     if (!url) return url;
     const sep = url.includes("?") ? "&" : "?";
@@ -1050,7 +1058,12 @@ export default function Preprocess() {
         setImages((prev) =>
           prev.map((img) =>
             img.id === currentImg.id
-              ? { ...img, maskData, hasMask, watermarkStatus: hasMask ? "marked" : "unmarked" }
+              ? {
+                ...img,
+                maskData: hasMask ? maskData : undefined,
+                hasMask,
+                watermarkStatus: getMaskStatusAfterUpdate(currentImg.watermarkStatus, hasMask),
+              }
               : img
           )
         );
@@ -1058,7 +1071,7 @@ export default function Preprocess() {
       }
       setPreviewIndex(newIndex);
     },
-    [previewIndex, successImages]
+    [previewIndex, successImages, getMaskStatusAfterUpdate]
   );
 
   const handlePrevImage = useCallback(() => {
@@ -1078,14 +1091,19 @@ export default function Preprocess() {
       setImages((prev) =>
         prev.map((img) =>
           img.id === currentImg.id
-            ? { ...img, maskData, hasMask, watermarkStatus: hasMask ? "marked" : "unmarked" }
+            ? {
+              ...img,
+              maskData: hasMask ? maskData : undefined,
+              hasMask,
+              watermarkStatus: getMaskStatusAfterUpdate(currentImg.watermarkStatus, hasMask),
+            }
             : img
         )
       );
       if (hasMask) setWatermarkDone(false);
     }
     setPreviewOpen(false);
-  }, [previewIndex, successImages]);
+  }, [previewIndex, successImages, getMaskStatusAfterUpdate]);
 
   const handleMaskChange = useCallback(
     (maskData: string, hasMask: boolean) => {
@@ -1094,13 +1112,18 @@ export default function Preprocess() {
       setImages((prev) =>
         prev.map((img) =>
           img.id === currentImg.id
-            ? { ...img, maskData, hasMask, watermarkStatus: hasMask ? "marked" : "unmarked" }
+            ? {
+              ...img,
+              maskData: hasMask ? maskData : undefined,
+              hasMask,
+              watermarkStatus: hasMask ? "marked" : getMaskStatusAfterUpdate(currentImg.watermarkStatus, false),
+            }
             : img
         )
       );
       if (hasMask) setWatermarkDone(false);
     },
-    [previewIndex, successImages]
+    [previewIndex, successImages, getMaskStatusAfterUpdate]
   );
 
   const syncCurrentMask = useCallback(() => {
@@ -1111,13 +1134,18 @@ export default function Preprocess() {
     setImages((prev) =>
       prev.map((img) =>
         img.id === currentImg.id
-          ? { ...img, maskData, hasMask, watermarkStatus: hasMask ? "marked" : "unmarked" }
+          ? {
+            ...img,
+            maskData: hasMask ? maskData : undefined,
+            hasMask,
+            watermarkStatus: getMaskStatusAfterUpdate(currentImg.watermarkStatus, hasMask),
+          }
           : img
       )
     );
     if (hasMask) setWatermarkDone(false);
     return { ...currentImg, maskData, hasMask };
-  }, [previewIndex, successImages]);
+  }, [previewIndex, successImages, getMaskStatusAfterUpdate]);
 
   // ========== 阶段三：一键去水印 ==========
   const markedImages = images.filter(
@@ -1630,31 +1658,17 @@ export default function Preprocess() {
             </div>
           )}
 
-          {/* 悬浮预览按钮（去水印阶段 - 未完成：打开标记工具） */}
-          {isWatermarkStage && img.status === "success" && !isRemovingWatermark && img.watermarkStatus !== "done" && (
+          {/* 悬浮预览按钮（去水印阶段：打开标记工具，可重标） */}
+          {isWatermarkStage && img.status === "success" && !isRemovingWatermark && (
             <div
               className="absolute inset-0 bg-black/0 group-hover:bg-black/40 transition-colors flex items-center justify-center cursor-pointer"
               onClick={() => handleOpenPreview(index)}
             >
               <div className="opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center gap-2">
                 <Eye className="w-8 h-8 text-white" />
-                <span className="text-white text-sm font-medium">点击标记水印</span>
-              </div>
-            </div>
-          )}
-
-          {/* 悬浮查看大图（去水印阶段 - 已完成） */}
-          {isWatermarkStage && img.status === "success" && img.watermarkStatus === "done" && (
-            <div
-              className="absolute inset-0 bg-black/0 group-hover:bg-black/40 transition-colors flex items-center justify-center cursor-pointer"
-              onClick={() => {
-                setSimplePreviewIndex(index);
-                setSimplePreviewOpen(true);
-              }}
-            >
-              <div className="opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center gap-2">
-                <ZoomIn className="w-8 h-8 text-white" />
-                <span className="text-white text-sm font-medium">查看大图</span>
+                <span className="text-white text-sm font-medium">
+                  {img.watermarkStatus === "done" ? "查看并重标水印" : "点击标记水印"}
+                </span>
               </div>
             </div>
           )}
@@ -1766,7 +1780,7 @@ export default function Preprocess() {
           )}
 
           {/* 去水印阶段的操作提示 */}
-          {isWatermarkStage && img.status === "success" && !isRemovingWatermark && img.watermarkStatus !== "done" && (
+          {isWatermarkStage && img.status === "success" && !isRemovingWatermark && (
             <Button
               size="sm"
               variant="outline"
@@ -1774,7 +1788,11 @@ export default function Preprocess() {
               onClick={() => handleOpenPreview(index)}
             >
               <Eye className="w-3 h-3 mr-1" />
-              {img.watermarkStatus === "marked" ? "修改水印标记" : "标记水印位置"}
+              {img.watermarkStatus === "done"
+                ? "查看并重标水印"
+                : img.watermarkStatus === "marked"
+                ? "修改水印标记"
+                : "标记水印位置"}
             </Button>
           )}
         </CardContent>
@@ -1887,7 +1905,7 @@ export default function Preprocess() {
                   </p>
                   <p className="text-xs text-muted-foreground mt-0.5">
                     点击图片进入大图预览，使用红色画笔涂抹水印区域。标记完成后点击"去水印"按钮一次性处理所有标记的图片。
-                    无水印的图片无需标记，将自动跳过。
+                    已显示“水印已去除”的图片也可再次进入大图重新标记并重试去水印。
                   </p>
                 </div>
               </div>
