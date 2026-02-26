@@ -267,6 +267,8 @@ class ConcurrentImageGenerator:
         seedream_model: str = "",
         nanobanana_model: str = "nano-banana-pro",
         disable_watermark: bool = True,
+        strict_no_watermark: bool = True,
+        watermark_cleanup_margin: float = 0.18,
         initial_concurrency: int = 10,
         max_concurrency: int = 50,
         max_retries: int = 2,
@@ -277,6 +279,8 @@ class ConcurrentImageGenerator:
             nanobanana_model=nanobanana_model,
             disable_watermark=disable_watermark,
         )
+        self.strict_no_watermark = strict_no_watermark
+        self.watermark_cleanup_margin = max(0.08, min(0.35, float(watermark_cleanup_margin)))
         self.initial_concurrency = initial_concurrency
         self.max_concurrency = max_concurrency
         self.max_retries = max_retries
@@ -284,6 +288,9 @@ class ConcurrentImageGenerator:
         self._current_concurrency = initial_concurrency
         self._success_streak = 0
         self._fail_streak = 0
+        self._watermark_remover = None
+        self._watermark_ready_checked = False
+        self._watermark_available = False
 
     def _adjust_concurrency(self, success: bool):
         """动态调整并发数"""
@@ -330,6 +337,13 @@ class ConcurrentImageGenerator:
                 )
 
                 if success:
+                    if self.strict_no_watermark:
+                        clean_ok = await self._force_remove_watermark(output_path)
+                        if not clean_ok:
+                            logger.error("强制无水印校验失败，转为失败重试: %s", output_path)
+                            success = False
+
+                if success:
                     self._adjust_concurrency(True)
                     return True
 
@@ -340,3 +354,74 @@ class ConcurrentImageGenerator:
 
             self._adjust_concurrency(False)
             return False
+
+    async def _ensure_watermark_remover(self) -> bool:
+        if not self.strict_no_watermark:
+            return True
+        if self._watermark_ready_checked:
+            return self._watermark_available
+
+        try:
+            from app.services.watermark_remover import WatermarkRemover
+
+            self._watermark_remover = WatermarkRemover(
+                detection_mode="fixed_region",
+                engine="auto",
+            )
+            self._watermark_available = await self._watermark_remover.health_check()
+        except Exception as e:
+            logger.error("初始化去水印引擎失败: %s", e)
+            self._watermark_available = False
+            self._watermark_remover = None
+        finally:
+            self._watermark_ready_checked = True
+
+        if not self._watermark_available:
+            logger.error("强制无水印模式开启，但去水印引擎不可用")
+        return self._watermark_available
+
+    async def _force_remove_watermark(self, output_path: str) -> bool:
+        """
+        强制执行一次角落去水印，兜底清理供应商残留角标。
+        P0要求：若无法清理则视为失败，不允许带水印出图。
+        """
+        if not output_path:
+            return False
+        src = Path(output_path)
+        if not src.exists():
+            return False
+        if not await self._ensure_watermark_remover():
+            return False
+        if not self._watermark_remover:
+            return False
+
+        tmp_path = src.with_suffix(".clean.tmp.jpg")
+        try:
+            ok = await self._watermark_remover.process_image(
+                input_path=str(src),
+                output_path=str(tmp_path),
+                region="bottom_right",
+                margin_ratio=self.watermark_cleanup_margin,
+            )
+            if not ok or not tmp_path.exists():
+                return False
+
+            tmp_path.replace(src)
+            logger.info("强制去水印完成: %s", src.name)
+            return True
+        except Exception as e:
+            logger.error("强制去水印失败: %s", e)
+            return False
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+
+    async def close(self):
+        if self._watermark_remover:
+            try:
+                await self._watermark_remover.close()
+            except Exception:
+                pass

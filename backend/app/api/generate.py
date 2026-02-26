@@ -40,6 +40,7 @@ def _run_generate_background(batch_id: str, engine: str):
 async def _async_batch_generate(batch_id: str, engine: str):
     """异步批量生图核心逻辑"""
     db = SessionLocal()
+    generator = None
     try:
         from app.services.image_generator import ConcurrentImageGenerator
 
@@ -48,6 +49,9 @@ async def _async_batch_generate(batch_id: str, engine: str):
         nanobanana_model = get_setting_value(db, "nanobanana_model_version", "nano-banana-pro")
         disable_generation_watermark = (
             get_setting_value(db, "disable_generation_watermark", "1").strip() != "0"
+        )
+        strict_no_watermark = (
+            get_setting_value(db, "strict_no_watermark", "1").strip() != "0"
         )
 
         # 查询所有待生成任务
@@ -82,16 +86,12 @@ async def _async_batch_generate(batch_id: str, engine: str):
                 f"开始批量生图: {total} 个任务, 引擎={engine}",
                 per_image=per_image)
 
-        # 标记为 processing
-        for t in tasks:
-            t.status = "processing"
-        db.commit()
-
         generator = ConcurrentImageGenerator(
             api_key=api_key,
             seedream_model=seedream_model,
             nanobanana_model=nanobanana_model,
             disable_watermark=disable_generation_watermark,
+            strict_no_watermark=strict_no_watermark,
         )
         completed_count = 0
         failed_count = 0
@@ -101,17 +101,34 @@ async def _async_batch_generate(batch_id: str, engine: str):
 
         async def process_task(task_obj):
             nonlocal completed_count, failed_count
+            if ps.is_cancel_requested(TASK_TYPE, batch_id):
+                return
 
             async with sem:
+                if ps.is_cancel_requested(TASK_TYPE, batch_id):
+                    return
+
                 task_id = task_obj.id
                 img_id = task_obj.base_image_id
 
                 # 获取底图路径
                 task_db = SessionLocal()
+                success = False
                 try:
                     t = task_db.query(GenerateTask).filter(GenerateTask.id == task_id).first()
                     img = task_db.query(BaseImage).filter(BaseImage.id == img_id).first()
                     if not t or not img:
+                        return
+
+                    if t.status == "completed":
+                        return
+
+                    t.status = "processing"
+                    task_db.commit()
+
+                    if ps.is_cancel_requested(TASK_TYPE, batch_id):
+                        t.status = "pending"
+                        task_db.commit()
                         return
 
                     ref_path = img.processed_path or img.original_path
@@ -186,6 +203,24 @@ async def _async_batch_generate(batch_id: str, engine: str):
         # 并发执行���有任务
         await asyncio.gather(*[process_task(t) for t in tasks])
 
+        if ps.is_cancel_requested(TASK_TYPE, batch_id):
+            reset_count = db.query(GenerateTask).join(BaseImage).filter(
+                BaseImage.batch_id == batch_id,
+                GenerateTask.status == "processing",
+            ).update({GenerateTask.status: "pending"}, synchronize_session=False)
+            if reset_count > 0:
+                db.commit()
+
+            ps.cancel(
+                TASK_TYPE,
+                batch_id,
+                completed_count,
+                failed_count,
+                f"批量生图已中断：已完成 {completed_count}，失败 {failed_count}，剩余任务保留为待处理",
+                per_image=per_image,
+            )
+            return
+
         # 更新批次状态
         batch = db.query(Batch).filter(Batch.id == batch_id).first()
         if batch:
@@ -200,6 +235,11 @@ async def _async_batch_generate(batch_id: str, engine: str):
         logger.error(f"批量生图失败 {batch_id}: {e}")
         ps.fail(TASK_TYPE, batch_id, f"生图出错: {str(e)}")
     finally:
+        if generator:
+            try:
+                await generator.close()
+            except Exception:
+                pass
         db.close()
 
 
@@ -215,8 +255,10 @@ async def start_generation(request: GenerateRequest, db: Session = Depends(get_d
     if not batch:
         raise HTTPException(status_code=404, detail="批次不存在")
 
-    if ps.is_running(TASK_TYPE, request.batch_id):
+    current = ps.get(TASK_TYPE, request.batch_id)
+    if current.get("status") in ("running", "cancelling"):
         return BaseResponse(code=1, message="该批次正在生图中")
+    ps.clear_cancel(TASK_TYPE, request.batch_id)
 
     # 统计待生成任务
     pending = db.query(GenerateTask).join(BaseImage).filter(
@@ -254,9 +296,21 @@ async def get_progress(batch_id: str):
     return BaseResponse(code=0, data=data)
 
 
+@router.post("/cancel/{batch_id}", response_model=BaseResponse)
+async def cancel_generation(batch_id: str):
+    """中断批量生图任务"""
+    if ps.request_cancel(TASK_TYPE, batch_id, "用户请求中断批量生图"):
+        return BaseResponse(code=0, message="已发送中断请求，当前任务将在安全点停止")
+    return BaseResponse(code=1, message="当前没有运行中的批量生图任务")
+
+
 @router.post("/retry", response_model=BaseResponse)
 async def retry_failed(request: GenerateRequest, db: Session = Depends(get_db)):
     """重试失败的生图任务"""
+    current = ps.get(TASK_TYPE, request.batch_id)
+    if current.get("status") in ("running", "cancelling"):
+        return BaseResponse(code=1, message="当前批次仍在运行中，请先等待或中断后再重试")
+
     failed_tasks = db.query(GenerateTask).join(BaseImage).filter(
         BaseImage.batch_id == request.batch_id,
         GenerateTask.status == "failed",
@@ -281,6 +335,7 @@ async def retry_failed(request: GenerateRequest, db: Session = Depends(get_db)):
         args=(request.batch_id, engine),
         daemon=True,
     )
+    ps.clear_cancel(TASK_TYPE, request.batch_id)
     t.start()
 
     return BaseResponse(code=0, message=f"正在重试 {len(failed_tasks)} 个失败任务", data={

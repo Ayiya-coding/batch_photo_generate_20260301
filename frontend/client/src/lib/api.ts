@@ -254,6 +254,11 @@ export const promptApi = {
     );
   },
 
+  /** 中断提示词生成 */
+  cancel(batchId: string) {
+    return unwrap(http.post(API.prompt.cancel(batchId)));
+  },
+
   /** 查询生成进度 */
   progress(batchId: string) {
     return unwrap<ProgressInfo>(http.get(API.prompt.progress(batchId)));
@@ -316,6 +321,11 @@ export const generateApi = {
   /** 查询生图进度 */
   progress(batchId: string) {
     return unwrap<GenerateProgressInfo>(http.get(API.generate.progress(batchId)));
+  },
+
+  /** 中断批量生图 */
+  cancel(batchId: string) {
+    return unwrap(http.post(API.generate.cancel(batchId)));
   },
 
   /** 重试失败任务 */
@@ -502,6 +512,11 @@ export const widefaceApi = {
   /** 查询宽脸图生成进度 */
   progress() {
     return unwrap<ProgressInfo>(http.get(API.wideface.progress));
+  },
+
+  /** 中断宽脸图生成 */
+  cancel() {
+    return unwrap(http.post(API.wideface.cancel));
   },
 
   /** 宽脸图审核 */

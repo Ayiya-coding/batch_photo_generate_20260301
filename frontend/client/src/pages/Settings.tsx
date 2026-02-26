@@ -429,6 +429,18 @@ export default function Settings() {
                 onCheckedChange={(v) => set("disable_generation_watermark", v ? "1" : "0")}
               />
             </div>
+            <div className="flex items-center justify-between rounded-md border p-3">
+              <div className="space-y-1">
+                <Label>强制无水印兜底</Label>
+                <p className="text-xs text-muted-foreground">
+                  生图成功后会再执行一次角落去水印；若清理失败则该图判定失败，杜绝带水印出图
+                </p>
+              </div>
+              <Switch
+                checked={cv(settings, "strict_no_watermark", "1") === "1"}
+                onCheckedChange={(v) => set("strict_no_watermark", v ? "1" : "0")}
+              />
+            </div>
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label>默认提示词前缀</Label>

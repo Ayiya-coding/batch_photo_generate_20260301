@@ -72,7 +72,25 @@ async def _async_generate_prompts(batch_id: str, crowd_type_ids: list):
         current_idx = 0
 
         for ct_id in crowd_type_ids:
+            if ps.is_cancel_requested(TASK_TYPE, batch_id):
+                ps.cancel(
+                    TASK_TYPE,
+                    batch_id,
+                    completed_count,
+                    failed_count,
+                    f"提示词生成已中断：已完成 {completed_count}，失败 {failed_count}",
+                )
+                return
             for style in styles:
+                if ps.is_cancel_requested(TASK_TYPE, batch_id):
+                    ps.cancel(
+                        TASK_TYPE,
+                        batch_id,
+                        completed_count,
+                        failed_count,
+                        f"提示词生成已中断：已完成 {completed_count}，失败 {failed_count}",
+                    )
+                    return
                 current_idx += 1
                 try:
                     positive, negative = await generator.generate_single(ct_id, style)
@@ -115,6 +133,26 @@ async def _async_generate_prompts(batch_id: str, crowd_type_ids: list):
         ps.append_log(TASK_TYPE, batch_id,
                       f"提示词模板完成，正在为 {len(base_images)} 张底图创建生成任务...")
 
+        # 保护：移除“当前选中人群之外”的待生成任务，避免误触发后继续跑95任务
+        stale_task_ids = [
+            row[0]
+            for row in db.query(GenerateTask.id).join(BaseImage).filter(
+                BaseImage.batch_id == batch_id,
+                ~GenerateTask.crowd_type.in_(crowd_type_ids),
+                GenerateTask.status.in_(["pending", "failed", "processing"]),
+            ).all()
+        ]
+        if stale_task_ids:
+            db.query(GenerateTask).filter(GenerateTask.id.in_(stale_task_ids)).delete(
+                synchronize_session=False
+            )
+            db.commit()
+            ps.append_log(
+                TASK_TYPE,
+                batch_id,
+                f"[CLEANUP] 已清理非当前人群的遗留任务 {len(stale_task_ids)} 条",
+            )
+
         templates = db.query(PromptTemplate).filter(
             PromptTemplate.crowd_type.in_(crowd_type_ids),
             PromptTemplate.is_active == True,
@@ -124,6 +162,15 @@ async def _async_generate_prompts(batch_id: str, crowd_type_ids: list):
         tasks_created = 0
 
         for img in base_images:
+            if ps.is_cancel_requested(TASK_TYPE, batch_id):
+                ps.cancel(
+                    TASK_TYPE,
+                    batch_id,
+                    completed_count,
+                    failed_count,
+                    f"提示词生成已中断：已完成 {completed_count}，失败 {failed_count}，已保留已创建任务",
+                )
+                return
             for ct_id in crowd_type_ids:
                 for style in styles:
                     existing_task = db.query(GenerateTask).filter(
@@ -170,16 +217,20 @@ async def generate_prompts(request: PromptGenerateRequest, db: Session = Depends
         raise HTTPException(status_code=404, detail="批次不存在")
 
     # 检查是否已在运行
-    if ps.is_running(TASK_TYPE, request.batch_id):
+    current = ps.get(TASK_TYPE, request.batch_id)
+    if current.get("status") in ("running", "cancelling"):
         return BaseResponse(code=1, message="该批次提示词正在生成中")
 
-    crowd_type_ids = request.crowd_types or list(CROWD_TYPES.keys())
+    crowd_type_ids = list(dict.fromkeys(request.crowd_types or []))
+    if not crowd_type_ids:
+        return BaseResponse(code=1, message="请先选择人群类型后再生成提示词")
 
     t = threading.Thread(
         target=_run_prompt_gen_background,
         args=(request.batch_id, crowd_type_ids),
         daemon=True,
     )
+    ps.clear_cancel(TASK_TYPE, request.batch_id)
     t.start()
 
     return BaseResponse(code=0, message="提示词生成已启动", data={
@@ -193,6 +244,14 @@ async def get_prompt_progress(batch_id: str):
     """查询提示词生成进度"""
     data = ps.get(TASK_TYPE, batch_id)
     return BaseResponse(code=0, data=data)
+
+
+@router.post("/cancel/{batch_id}", response_model=BaseResponse)
+async def cancel_prompt_generation(batch_id: str):
+    """中断提示词生成任务"""
+    if ps.request_cancel(TASK_TYPE, batch_id, "用户请求中断提示词生成"):
+        return BaseResponse(code=0, message="已发送中断请求，任务将在安全点停止")
+    return BaseResponse(code=1, message="当前没有运行中的提示词任务")
 
 
 @router.get("/list", response_model=BaseResponse)

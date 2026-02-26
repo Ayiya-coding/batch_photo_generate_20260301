@@ -8,7 +8,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { toast } from "sonner";
 import {
   Wand2, Save, ChevronRight, ChevronDown,
-  Trash2, Edit3, Sparkles, RefreshCw, ImageIcon, Loader2,
+  Trash2, Edit3, Sparkles, RefreshCw, ImageIcon, Loader2, Pause,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useUpload } from "@/contexts/UploadContext";
@@ -156,7 +156,7 @@ export default function PromptConfig() {
 
       setGenProgress(info);
 
-      if (info.status === "completed" || info.status === "error") {
+      if (info.status === "completed" || info.status === "error" || info.status === "cancelled") {
         return info;
       }
     }
@@ -179,6 +179,9 @@ export default function PromptConfig() {
           setIsGenerating(false);
           if (finalInfo?.status === "completed") {
             toast.success("提示词生成完成！");
+            loadPrompts();
+          } else if (finalInfo?.status === "cancelled") {
+            toast.info("提示词生成已中断");
             loadPrompts();
           } else {
             toast.error("提示词生成失败或超时");
@@ -219,6 +222,9 @@ export default function PromptConfig() {
     if (finalInfo?.status === "completed") {
       toast.success(`「${typeName}」提示词生成完成！`);
       await loadPrompts();
+    } else if (finalInfo?.status === "cancelled") {
+      toast.info(`「${typeName}」提示词生成已中断`);
+      await loadPrompts();
     } else {
       toast.error("提示词生成失败或超时");
     }
@@ -250,10 +256,21 @@ export default function PromptConfig() {
     if (finalInfo?.status === "completed") {
       toast.success(`「${typeName}」提示词已重新生成`);
       await loadPrompts();
+    } else if (finalInfo?.status === "cancelled") {
+      toast.info(`「${typeName}」提示词生成已中断`);
+      await loadPrompts();
     } else {
       toast.error("重新生成失败或超时");
     }
   }, [batchId, pollGenerateProgress, loadPrompts]);
+
+  const handleCancelGenerate = useCallback(async () => {
+    if (!batchId) return;
+    const result = await promptApi.cancel(batchId);
+    if (result !== undefined) {
+      toast.info("已发送中断请求，任务将在安全点停止");
+    }
+  }, [batchId]);
 
   // ========== 编辑提示词（防抖自动保存） ==========
 
@@ -348,6 +365,12 @@ export default function PromptConfig() {
             <Save className="w-4 h-4 mr-2" />
             保存配置
           </Button>
+          {isGenerating && (
+            <Button variant="destructive" size="sm" onClick={handleCancelGenerate}>
+              <Pause className="w-4 h-4 mr-2" />
+              中断
+            </Button>
+          )}
           <Button size="sm" onClick={handleGenerateSelected} disabled={isGenerating || !expandedType}>
             {isGenerating ? (
               <Loader2 className="w-4 h-4 mr-2 animate-spin" />

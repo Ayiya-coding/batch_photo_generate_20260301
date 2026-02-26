@@ -39,6 +39,7 @@ def _run_wideface_background(template_ids: list[str], engine: str):
 async def _async_wideface_generate(template_ids: list[str], engine: str):
     """异步宽脸图生成核心逻辑"""
     db = SessionLocal()
+    generator = None
     try:
         from app.services.image_generator import ConcurrentImageGenerator
 
@@ -48,6 +49,9 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
         ) or settings.WIDEFACE_SYSTEM_PROMPT
         disable_generation_watermark = (
             get_setting_value(db, "disable_generation_watermark", "1").strip() != "0"
+        )
+        strict_no_watermark = (
+            get_setting_value(db, "strict_no_watermark", "1").strip() != "0"
         )
 
         templates = db.query(TemplateImage).filter(
@@ -64,6 +68,7 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
         generator = ConcurrentImageGenerator(
             api_key=api_key,
             disable_watermark=disable_generation_watermark,
+            strict_no_watermark=strict_no_watermark,
         )
         completed = 0
         failed = 0
@@ -72,8 +77,12 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
 
         async def process_one(tmpl_id: str):
             nonlocal completed, failed
+            if ps.is_cancel_requested(TASK_TYPE, TASK_KEY):
+                return
 
             async with sem:
+                if ps.is_cancel_requested(TASK_TYPE, TASK_KEY):
+                    return
                 task_db = SessionLocal()
                 try:
                     tmpl = task_db.query(TemplateImage).filter(
@@ -119,6 +128,23 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
 
         await asyncio.gather(*[process_one(tid) for tid in template_ids])
 
+        if ps.is_cancel_requested(TASK_TYPE, TASK_KEY):
+            reset_count = db.query(TemplateImage).filter(
+                TemplateImage.id.in_(template_ids),
+                TemplateImage.wide_face_status == "processing",
+            ).update({TemplateImage.wide_face_status: "none"}, synchronize_session=False)
+            if reset_count > 0:
+                db.commit()
+
+            ps.cancel(
+                TASK_TYPE,
+                TASK_KEY,
+                completed,
+                failed,
+                f"宽脸图生成已中断：已完成 {completed}，失败 {failed}，剩余任务已恢复待生成",
+            )
+            return
+
         ps.finish(TASK_TYPE, TASK_KEY, completed, failed,
                   f"宽脸图生成完成！成功 {completed} 张，失败 {failed} 张")
 
@@ -126,6 +152,11 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
         logger.error(f"宽脸图生成失败: {e}")
         ps.fail(TASK_TYPE, TASK_KEY, f"宽脸图生成出错: {str(e)}")
     finally:
+        if generator:
+            try:
+                await generator.close()
+            except Exception:
+                pass
         db.close()
 
 
@@ -149,7 +180,8 @@ async def generate_wideface(
     request: WideFaceGenerateRequest, db: Session = Depends(get_db)
 ):
     """批量生成宽脸图"""
-    if ps.is_running(TASK_TYPE, TASK_KEY):
+    current = ps.get(TASK_TYPE, TASK_KEY)
+    if current.get("status") in ("running", "cancelling"):
         return BaseResponse(code=1, message="宽脸图生成任务正在进行中")
 
     # 验证模板存在
@@ -169,6 +201,7 @@ async def generate_wideface(
         args=(request.template_ids, engine),
         daemon=True,
     )
+    ps.clear_cancel(TASK_TYPE, TASK_KEY)
     t.start()
 
     return BaseResponse(code=0, message="宽脸图生成已启动", data={
@@ -182,6 +215,14 @@ async def get_wideface_progress():
     """获取宽脸图生成进度"""
     data = ps.get(TASK_TYPE, TASK_KEY)
     return BaseResponse(code=0, data=data)
+
+
+@router.post("/cancel", response_model=BaseResponse)
+async def cancel_wideface():
+    """中断宽脸图生成任务"""
+    if ps.request_cancel(TASK_TYPE, TASK_KEY, "用户请求中断宽脸图生成"):
+        return BaseResponse(code=0, message="已发送中断请求，任务将在安全点停止")
+    return BaseResponse(code=1, message="当前没有运行中的宽脸图任务")
 
 
 @router.post("/review", response_model=BaseResponse)

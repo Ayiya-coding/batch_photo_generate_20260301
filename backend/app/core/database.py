@@ -95,6 +95,7 @@ DEFAULT_SETTINGS = [
     ("apiyi_api_key", "", "API易平台统一API Key（SeedDream 4.5 + Nano Banana Pro）"),
     ("generate_model_version", "seedream-4-5-251128", "模型版本"),
     ("disable_generation_watermark", "1", "关闭生图水印(1=关闭/0=保留)"),
+    ("strict_no_watermark", "1", "强制无水印校验(1=开启，失败则整张判失败)"),
     ("generate_prompt_prefix", "", "默认提示词前缀"),
     ("generate_prompt_suffix", "", "默认提示词后缀"),
     # 配置项5：宽脸版本生成配置

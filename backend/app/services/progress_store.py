@@ -45,6 +45,7 @@ def _default_progress() -> dict:
         "total": 0,
         "completed": 0,
         "failed": 0,
+        "cancel_requested": False,
         "logs": [],
     }
 
@@ -163,6 +164,7 @@ def init(task_type: str, task_key: str, total: int, first_log: str, **extra) -> 
         "total": total,
         "completed": 0,
         "failed": 0,
+        "cancel_requested": False,
         "logs": [first_log],
         **extra,
     }
@@ -178,11 +180,67 @@ def finish(task_type: str, task_key: str, completed: int, failed: int, final_log
         "progress": 100,
         "completed": completed,
         "failed": failed,
+        "cancel_requested": False,
         **extra,
     })
     logs = current.get("logs", [])
     logs.append(final_log)
     current["logs"] = logs
+    set(task_type, task_key, current)
+
+
+def cancel(task_type: str, task_key: str, completed: int, failed: int, final_log: str, **extra):
+    """标记任务已中断"""
+    current = get(task_type, task_key)
+    total = int(current.get("total") or 0)
+    done = int(completed or 0) + int(failed or 0)
+    progress = int(done / total * 100) if total > 0 else int(current.get("progress") or 0)
+    current.update({
+        "status": "cancelled",
+        "progress": progress,
+        "completed": completed,
+        "failed": failed,
+        "cancel_requested": False,
+        **extra,
+    })
+    logs = current.get("logs", [])
+    logs.append(final_log)
+    current["logs"] = logs
+    set(task_type, task_key, current)
+
+
+def request_cancel(task_type: str, task_key: str, reason: str = "收到中断请求") -> bool:
+    """请求中断运行中的任务"""
+    current = get(task_type, task_key)
+    status = current.get("status")
+    if status not in ("running", "cancelling"):
+        return False
+
+    if current.get("cancel_requested") and status == "cancelling":
+        return True
+
+    current["cancel_requested"] = True
+    current["status"] = "cancelling"
+    logs = current.get("logs", [])
+    logs.append(reason)
+    current["logs"] = logs
+    set(task_type, task_key, current)
+    return True
+
+
+def is_cancel_requested(task_type: str, task_key: str) -> bool:
+    """是否已收到中断请求"""
+    return bool(get(task_type, task_key).get("cancel_requested"))
+
+
+def clear_cancel(task_type: str, task_key: str):
+    """清理中断标记（启动新任务前调用）"""
+    current = get(task_type, task_key)
+    if not current.get("cancel_requested") and current.get("status") != "cancelling":
+        return
+    current["cancel_requested"] = False
+    if current.get("status") == "cancelling":
+        current["status"] = "running"
     set(task_type, task_key, current)
 
 
@@ -194,6 +252,7 @@ def fail(task_type: str, task_key: str, error_msg: str):
         "total": 0,
         "completed": 0,
         "failed": 0,
+        "cancel_requested": False,
         "logs": [error_msg],
     }
     set(task_type, task_key, data)

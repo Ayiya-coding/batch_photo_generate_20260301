@@ -56,7 +56,7 @@ export default function BatchGenerate() {
     // 同步刷新概览数字
     fetchOverview();
 
-    if (data.status === "completed" || data.status === "error") {
+    if (data.status === "completed" || data.status === "error" || data.status === "cancelled") {
       stopPolling();
       setIsRunning(false);
 
@@ -66,6 +66,9 @@ export default function BatchGenerate() {
       }
       if (data.status === "error") {
         toast.error("生图任务出错，请查看日志");
+      }
+      if (data.status === "cancelled") {
+        toast.info("批量生图已中断，剩余任务已保留为待处理");
       }
     }
   }, [batchId, fetchOverview]);
@@ -120,7 +123,7 @@ export default function BatchGenerate() {
     generateApi.progress(batchId).then((data) => {
       if (data) {
         setProgress(data);
-        if (data.status === "running") {
+        if (data.status === "running" || data.status === "cancelling") {
           setIsRunning(true);
           notifiedRef.current = false;
           startPolling();
@@ -165,6 +168,16 @@ export default function BatchGenerate() {
     }
   };
 
+  const handleCancel = async () => {
+    if (!batchId) return;
+    const result = await generateApi.cancel(batchId);
+    if (result !== undefined) {
+      toast.info("已发送中断请求，当前任务会在安全点停止");
+      setIsRunning(true);
+      startPolling();
+    }
+  };
+
   // --- 计算数据 ---
   const totalProgress = progress?.progress ?? overview?.progress ?? 0;
   const totalTasks = progress?.total ?? overview?.total_tasks ?? 0;
@@ -196,7 +209,20 @@ export default function BatchGenerate() {
             进度: {completedTasks}/{totalTasks}
           </span>
           {isRunning ? (
-            <Badge className="bg-primary text-white animate-pulse">生成中...</Badge>
+            <>
+              <Badge className="bg-primary text-white animate-pulse">
+                {progress?.status === "cancelling" ? "中断中..." : "生成中..."}
+              </Badge>
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={handleCancel}
+                disabled={loading || progress?.status === "cancelling"}
+              >
+                <Pause className="w-4 h-4 mr-2" />
+                {progress?.status === "cancelling" ? "中断请求已发送" : "中断任务"}
+              </Button>
+            </>
           ) : (
             <>
               {failedTasks > 0 && (
@@ -275,6 +301,8 @@ export default function BatchGenerate() {
                 <CheckCircle className="w-4 h-4 text-green-500" />
               ) : status === "error" ? (
                 <AlertCircle className="w-4 h-4 text-destructive" />
+              ) : status === "cancelled" ? (
+                <Pause className="w-4 h-4 text-amber-500" />
               ) : (
                 <Info className="w-4 h-4" />
               )}

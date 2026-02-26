@@ -3,7 +3,7 @@ import { MainLayout } from "@/components/layout";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { toast } from "sonner";
-import { Play, RefreshCw, Save, Check, ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
+import { Play, RefreshCw, Save, Check, ChevronLeft, ChevronRight, Loader2, Pause } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { widefaceApi, templateApi, toFileUrl, type TemplateItem } from "@/lib/api";
 import { useUpload } from "@/contexts/UploadContext";
@@ -130,16 +130,18 @@ export default function WideFace() {
 
         setProgress(info.progress ?? 0);
 
-        if (info.status === "completed" || info.status === "error") {
+        if (info.status === "completed" || info.status === "error" || info.status === "cancelled") {
           stopPolling();
           await refreshTemplates();
           setIsGenerating(false);
-          setProgress(100);
-          toast.success(
-            info.status === "completed"
-              ? `宽脸图生成完成！成功 ${info.completed} 张，失败 ${info.failed} 张`
-              : "宽脸图生成出错，请检查后端日志",
-          );
+          setProgress(info.status === "completed" ? 100 : (info.progress ?? 0));
+          if (info.status === "completed") {
+            toast.success(`宽脸图生成完成！成功 ${info.completed} 张，失败 ${info.failed} 张`);
+          } else if (info.status === "cancelled") {
+            toast.info("宽脸图生成已中断，剩余任务保留为待生成");
+          } else {
+            toast.error("宽脸图生成出错，请检查后端日志");
+          }
         }
       } catch (err) {
         console.error("Polling error:", err);
@@ -152,7 +154,7 @@ export default function WideFace() {
     (async () => {
       try {
         const info = await widefaceApi.progress();
-        if (info && info.status === "running") {
+        if (info && (info.status === "running" || info.status === "cancelling")) {
           setIsGenerating(true);
           setProgress(info.progress ?? 0);
           startPolling();
@@ -218,6 +220,15 @@ export default function WideFace() {
     }
   };
 
+  const handleCancel = async () => {
+    const result = await widefaceApi.cancel();
+    if (result !== undefined) {
+      toast.info("已发送中断请求，任务将在安全点停止");
+      setIsGenerating(true);
+      startPolling();
+    }
+  };
+
   // ---- 全选 / 全不选 ----
   const handleSelectAll = () => {
     const next = !isAllSelected;
@@ -266,14 +277,22 @@ export default function WideFace() {
         {/* 顶部：生成按钮和进度条 */}
         <div className="mb-6 p-4 bg-white rounded-lg border">
           <div className="flex items-center justify-between mb-4">
-            <Button
-              onClick={handleStartGeneration}
-              disabled={isGenerating || loading}
-              className="bg-primary hover:bg-primary/90"
-            >
-              {loading ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Play className="w-4 h-4 mr-2" />}
-              开始生成宽脸图
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                onClick={handleStartGeneration}
+                disabled={isGenerating || loading}
+                className="bg-primary hover:bg-primary/90"
+              >
+                {loading ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Play className="w-4 h-4 mr-2" />}
+                开始生成宽脸图
+              </Button>
+              {isGenerating && (
+                <Button variant="destructive" onClick={handleCancel}>
+                  <Pause className="w-4 h-4 mr-2" />
+                  中断生成
+                </Button>
+              )}
+            </div>
             <span className="text-sm text-muted-foreground">
               选用库 - {SINGLE_CROWD_TYPE_IDS.length}类单人照，共{totalImages}张图片 | 进度: {progressPercentage}% ({completedImages}/{totalImages})
             </span>

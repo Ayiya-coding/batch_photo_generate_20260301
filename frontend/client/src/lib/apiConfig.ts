@@ -25,6 +25,7 @@ export const API = {
   prompt: {
     generate: `${API_BASE}/prompt/generate`,
     progress: (batchId: string) => `${API_BASE}/prompt/progress/${batchId}`,
+    cancel: (batchId: string) => `${API_BASE}/prompt/cancel/${batchId}`,
     list: `${API_BASE}/prompt/list`,
     edit: (id: string) => `${API_BASE}/prompt/edit/${id}`,
     delete: (id: string) => `${API_BASE}/prompt/delete/${id}`,
@@ -34,6 +35,7 @@ export const API = {
   generate: {
     start: `${API_BASE}/generate/start`,
     progress: (batchId: string) => `${API_BASE}/generate/progress/${batchId}`,
+    cancel: (batchId: string) => `${API_BASE}/generate/cancel/${batchId}`,
     retry: `${API_BASE}/generate/retry`,
     overview: (batchId: string) => `${API_BASE}/generate/overview/${batchId}`,
   },
@@ -63,6 +65,7 @@ export const API = {
   wideface: {
     generate: `${API_BASE}/wideface/generate`,
     progress: `${API_BASE}/wideface/progress`,
+    cancel: `${API_BASE}/wideface/cancel`,
     review: `${API_BASE}/wideface/review`,
   },
 
