@@ -140,7 +140,7 @@ export default function PromptConfig() {
     loadPrompts();
   }, [loadPrompts]);
 
-  // ========== 一键生成全部 ==========
+  // ========== 生成当前选中类型 ==========
 
   const pollGenerateProgress = useCallback(async (bid: string) => {
     const POLL_INTERVAL = 2000;
@@ -189,35 +189,40 @@ export default function PromptConfig() {
     return () => { cancelled = true; };
   }, [batchId, pollGenerateProgress, loadPrompts]);
 
-  const handleGenerateAll = useCallback(async () => {
+  const handleGenerateSelected = useCallback(async () => {
     if (!batchId) {
       toast.info("演示模式：无法调用后端生成");
+      return;
+    }
+    if (!expandedType) {
+      toast.info("请先选择一个人群类型");
       return;
     }
 
     setIsGenerating(true);
     setGenProgress(null);
 
-    const result = await promptApi.generate(batchId!);
+    const result = await promptApi.generate(batchId!, [expandedType]);
     if (!result) {
       setIsGenerating(false);
       return;
     }
 
+    const typeName = allTypes.find((t) => t.id === expandedType)?.name || expandedType;
     toast.info("提示词生成已启动", {
-      description: `正在为 ${result.crowd_types_count} 种人群类型生成提示词...`,
+      description: `正在为「${typeName}」生成提示词（${result.crowd_types_count} 种）...`,
     });
 
     const finalInfo = await pollGenerateProgress(batchId!);
     setIsGenerating(false);
 
     if (finalInfo?.status === "completed") {
-      toast.success("提示词生成完成！");
+      toast.success(`「${typeName}」提示词生成完成！`);
       await loadPrompts();
     } else {
       toast.error("提示词生成失败或超时");
     }
-  }, [batchId, pollGenerateProgress, loadPrompts]);
+  }, [batchId, expandedType, pollGenerateProgress, loadPrompts]);
 
   // ========== 为单个人群类型重新生成 ==========
 
@@ -343,13 +348,13 @@ export default function PromptConfig() {
             <Save className="w-4 h-4 mr-2" />
             保存配置
           </Button>
-          <Button size="sm" onClick={handleGenerateAll} disabled={isGenerating}>
+          <Button size="sm" onClick={handleGenerateSelected} disabled={isGenerating || !expandedType}>
             {isGenerating ? (
               <Loader2 className="w-4 h-4 mr-2 animate-spin" />
             ) : (
               <Wand2 className="w-4 h-4 mr-2" />
             )}
-            {isGenerating ? "生成中..." : "一键生成全部"}
+            {isGenerating ? "生成中..." : "生成当前类型"}
           </Button>
         </div>
       }
@@ -614,7 +619,7 @@ export default function PromptConfig() {
                     <div className="text-center py-12">
                       <p className="text-muted-foreground mb-4">
                         {batchId
-                          ? "暂无提示词，请点击「一键生成全部」或「AI重新生成」"
+                          ? "暂无提示词，请点击「生成当前类型」或「AI重新生成」"
                           : "暂无提示词（演示模式）"}
                       </p>
                       {batchId && (
