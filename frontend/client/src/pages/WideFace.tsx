@@ -12,14 +12,13 @@ interface WideFaceImage {
   id: string;
   originalUrl: string;
   wideFaceUrl: string;
-  crowdType: "少女" | "熟女" | "奶奶" | "少男" | "大叔";
+  crowdType: string;
   selected: boolean;
   wideFaceStatus: string | null;
 }
 
-// 5类单人照
-const CROWD_TYPES = ["少女", "熟女", "奶奶", "少男", "大叔"] as const;
-const SINGLE_TYPES: string[] = [...CROWD_TYPES];
+// 宽脸图适用人群类型：在原5类基础上补充幼女(C01)
+const SINGLE_CROWD_TYPE_IDS = ["C01", "C02", "C03", "C04", "C06", "C07"] as const;
 
 /** 将 TemplateItem[] 映射为 WideFaceImage[] */
 function templatesToImages(items: TemplateItem[]): WideFaceImage[] {
@@ -27,7 +26,7 @@ function templatesToImages(items: TemplateItem[]): WideFaceImage[] {
     id: item.id,
     originalUrl: toFileUrl(item.original_path) || templateApi.imageUrl(item.id),
     wideFaceUrl: item.wide_face_path ? toFileUrl(item.wide_face_path) : "",
-    crowdType: item.crowd_name as WideFaceImage["crowdType"],
+    crowdType: item.crowd_name,
     selected: true,
     wideFaceStatus: item.wide_face_status,
   }));
@@ -60,7 +59,9 @@ export default function WideFace() {
         const result = await templateApi.list({ final_status: "selected", page_size: 500 });
         if (cancelled) return;
         if (result?.items && result.items.length > 0) {
-          const filtered = result.items.filter((t) => SINGLE_TYPES.includes(t.crowd_name));
+          const filtered = result.items.filter((t) =>
+            SINGLE_CROWD_TYPE_IDS.includes(t.crowd_type as (typeof SINGLE_CROWD_TYPE_IDS)[number]),
+          );
           if (filtered.length > 0) {
             const mapped = templatesToImages(filtered);
             setImages(mapped);
@@ -90,7 +91,9 @@ export default function WideFace() {
     try {
       const result = await templateApi.list({ final_status: "selected", page_size: 500 });
       if (!result?.items) return;
-      const filtered = result.items.filter((t) => SINGLE_TYPES.includes(t.crowd_name));
+      const filtered = result.items.filter((t) =>
+        SINGLE_CROWD_TYPE_IDS.includes(t.crowd_type as (typeof SINGLE_CROWD_TYPE_IDS)[number]),
+      );
       const latest = templatesToImages(filtered);
       setImages((prev) => {
         const selectedMap = new Map(prev.map((img) => [img.id, img.selected]));
@@ -259,7 +262,7 @@ export default function WideFace() {
               开始生成宽脸图
             </Button>
             <span className="text-sm text-muted-foreground">
-              选用库 - 5类单人照，共{totalImages}张图片 | 进度: {progressPercentage}% ({completedImages}/{totalImages})
+              选用库 - {SINGLE_CROWD_TYPE_IDS.length}类单人照，共{totalImages}张图片 | 进度: {progressPercentage}% ({completedImages}/{totalImages})
             </span>
           </div>
 
