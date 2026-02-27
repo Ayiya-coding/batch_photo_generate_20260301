@@ -83,7 +83,15 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
             return
 
         total = len(templates)
-        ps.init(TASK_TYPE, TASK_KEY, total, f"开始宽脸图生成: {total} 张, 引擎={engine}")
+        reason_stats: dict[str, int] = {}
+        ps.init(
+            TASK_TYPE,
+            TASK_KEY,
+            total,
+            f"开始宽脸图生成: {total} 张, 引擎={engine}",
+            reason_stats=reason_stats,
+        )
+        quota_alerted = False
 
         generator = ConcurrentImageGenerator(
             api_key=api_key,
@@ -102,7 +110,7 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
         sem = asyncio.Semaphore(5)  # 宽脸图并发较低
 
         async def process_one(tmpl_id: str):
-            nonlocal completed, failed
+            nonlocal completed, failed, quota_alerted
             if ps.is_cancel_requested(TASK_TYPE, TASK_KEY):
                 return
 
@@ -127,7 +135,7 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
 
                     prompt = f"{wideface_prompt}, based on the original photo, generate a wider face version"
 
-                    success = await generator.generate_single_with_retry(
+                    success, fail_detail, fail_codes = await generator.generate_single_with_retry_detail(
                         engine=engine,
                         prompt=prompt,
                         negative_prompt="distorted, deformed, ugly, blurry",
@@ -145,8 +153,21 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
                     else:
                         tmpl.wide_face_status = "failed"
                         failed += 1
+                        if fail_codes:
+                            for code in fail_codes:
+                                reason_stats[code] = reason_stats.get(code, 0) + 1
                         _update_progress(total, completed, failed,
-                                         f"[FAIL] {tmpl.crowd_type}-{tmpl.style_name}")
+                                         f"[FAIL] {tmpl.crowd_type}-{tmpl.style_name} | {fail_detail or '未知失败'}",
+                                         reason_stats=reason_stats)
+                        if ("insufficient_user_quota" in (fail_codes or [])) and (not quota_alerted):
+                            _update_progress(
+                                total,
+                                completed,
+                                failed,
+                                "[ALERT] 检测到上游额度不足（insufficient_user_quota）：请充值 API易 或更换可用 Key 后再重试。",
+                                reason_stats=reason_stats,
+                            )
+                            quota_alerted = True
 
                     task_db.commit()
                 finally:
@@ -168,11 +189,24 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
                 completed,
                 failed,
                 f"宽脸图生成已中断：已完成 {completed}，失败 {failed}，剩余任务已恢复待生成",
+                reason_stats=reason_stats,
             )
             return
 
-        ps.finish(TASK_TYPE, TASK_KEY, completed, failed,
-                  f"宽脸图生成完成！成功 {completed} 张，失败 {failed} 张")
+        summary = f"宽脸图生成完成！成功 {completed} 张，失败 {failed} 张"
+        if reason_stats:
+            detail = ", ".join(
+                [f"{k}={v}" for k, v in sorted(reason_stats.items(), key=lambda x: (-x[1], x[0]))]
+            )
+            summary += f" | 失败原因统计: {detail}"
+        ps.finish(
+            TASK_TYPE,
+            TASK_KEY,
+            completed,
+            failed,
+            summary,
+            reason_stats=reason_stats,
+        )
 
     except Exception as e:
         logger.error(f"宽脸图生成失败: {e}")
@@ -186,7 +220,13 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
         db.close()
 
 
-def _update_progress(total: int, completed: int, failed: int, log_msg: str):
+def _update_progress(
+    total: int,
+    completed: int,
+    failed: int,
+    log_msg: str,
+    reason_stats: dict | None = None,
+):
     done = completed + failed
     progress = int(done / total * 100) if total > 0 else 0
     current = ps.get(TASK_TYPE, TASK_KEY)
@@ -195,6 +235,8 @@ def _update_progress(total: int, completed: int, failed: int, log_msg: str):
         "completed": completed,
         "failed": failed,
     })
+    if reason_stats is not None:
+        current["reason_stats"] = reason_stats
     logs = current.get("logs", [])
     logs.append(log_msg)
     current["logs"] = logs

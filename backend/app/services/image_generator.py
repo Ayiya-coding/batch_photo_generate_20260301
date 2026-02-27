@@ -374,6 +374,36 @@ class ConcurrentImageGenerator:
         self._watermark_remover = None
         self._watermark_ready_checked = False
         self._watermark_available = False
+        self._last_watermark_error = ""
+
+    @staticmethod
+    def _reason_tip(reason_code: str) -> str:
+        tips = {
+            "insufficient_user_quota": "上游额度不足，请充值 API易 或更换可用 Key。",
+            "no_available_channel": "上游渠道不可用，请在 API易 控制台检查模型渠道状态。",
+            "rate_limited": "请求频率受限，请降低并发后重试。",
+            "unauthorized": "API Key 无效或权限不足，请检查密钥配置。",
+            "upstream_server_error": "上游服务异常，可稍后重试。",
+            "request_error": "网络请求异常，请检查网络连通性。",
+            "strict_no_watermark_cleanup_failed": "严格无水印校验失败，生成结果被拦截。",
+            "watermark_remover_unavailable": "去水印引擎不可用（Volc/IOPaint），请检查去水印配置。",
+            "watermark_cleanup_exception": "去水印处理异常，请查看后端日志。",
+            "unknown_failure": "未知失败，请查看后端日志。",
+        }
+        return tips.get(reason_code, "任务失败，请查看详细日志。")
+
+    @staticmethod
+    def _format_failure_detail(reason_messages: dict[str, str]) -> str:
+        if not reason_messages:
+            return "未知失败（无错误码）"
+        parts = []
+        for code, raw_msg in reason_messages.items():
+            tip = ConcurrentImageGenerator._reason_tip(code)
+            if raw_msg:
+                parts.append(f"{code}: {tip} 原始信息: {raw_msg}")
+            else:
+                parts.append(f"{code}: {tip}")
+        return " | ".join(parts)
 
     def _adjust_concurrency(self, success: bool):
         """动态调整并发数"""
@@ -398,7 +428,7 @@ class ConcurrentImageGenerator:
                 self._fail_streak = 0
                 logger.info(f"并发数降低至 {self._current_concurrency}")
 
-    async def generate_single_with_retry(
+    async def generate_single_with_retry_detail(
         self,
         engine: str,
         prompt: str,
@@ -406,8 +436,17 @@ class ConcurrentImageGenerator:
         reference_image_path: str,
         reference_weight: int,
         output_path: str,
-    ) -> bool:
-        """带重试的单图生成"""
+    ) -> tuple[bool, str, list[str]]:
+        """带重试的单图生成（返回详细失败原因）"""
+        reason_messages: dict[str, str] = {}
+
+        def add_reason(code: str, msg: str = ""):
+            norm_code = (code or "unknown_failure").strip()
+            if not norm_code:
+                norm_code = "unknown_failure"
+            if norm_code not in reason_messages:
+                reason_messages[norm_code] = (msg or "").strip()[:220]
+
         async with self._semaphore:
             for attempt in range(self.max_retries + 1):
                 success = await self.client.generate_image(
@@ -424,19 +463,61 @@ class ConcurrentImageGenerator:
                         clean_ok = await self._force_remove_watermark(output_path)
                         if not clean_ok:
                             logger.error("强制无水印校验失败，转为失败重试: %s", output_path)
+                            if self._last_watermark_error:
+                                if "引擎不可用" in self._last_watermark_error:
+                                    add_reason("watermark_remover_unavailable", self._last_watermark_error)
+                                else:
+                                    add_reason("watermark_cleanup_exception", self._last_watermark_error)
+                            add_reason("strict_no_watermark_cleanup_failed")
                             success = False
+                else:
+                    if self.client.last_error_code:
+                        add_reason(self.client.last_error_code, self.client.last_error_message)
+                    else:
+                        add_reason("unknown_failure")
 
                 if success:
                     self._adjust_concurrency(True)
-                    return True
+                    return True, "", []
 
                 if attempt < self.max_retries:
                     wait = (attempt + 1) * 2
-                    logger.warning(f"生图失败，{wait}s 后重试 ({attempt+1}/{self.max_retries})")
+                    detail = self._format_failure_detail(reason_messages)
+                    logger.warning(
+                        "生图失败，%ss 后重试 (%s/%s) | %s",
+                        wait,
+                        attempt + 1,
+                        self.max_retries,
+                        detail,
+                    )
                     await asyncio.sleep(wait)
 
             self._adjust_concurrency(False)
-            return False
+            detail = self._format_failure_detail(reason_messages)
+            return False, detail, list(reason_messages.keys())
+
+    async def generate_single_with_retry(
+        self,
+        engine: str,
+        prompt: str,
+        negative_prompt: str,
+        reference_image_path: str,
+        reference_weight: int,
+        output_path: str,
+    ) -> bool:
+        """
+        兼容旧调用：仅返回成功/失败。
+        新调用请使用 generate_single_with_retry_detail 获取失败原因。
+        """
+        ok, _, _ = await self.generate_single_with_retry_detail(
+            engine=engine,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            reference_image_path=reference_image_path,
+            reference_weight=reference_weight,
+            output_path=output_path,
+        )
+        return ok
 
     async def _ensure_watermark_remover(self) -> bool:
         if not self.strict_no_watermark:
@@ -462,11 +543,13 @@ class ConcurrentImageGenerator:
             logger.error("初始化去水印引擎失败: %s", e)
             self._watermark_available = False
             self._watermark_remover = None
+            self._last_watermark_error = f"初始化去水印引擎失败: {e}"
         finally:
             self._watermark_ready_checked = True
 
         if not self._watermark_available:
             logger.error("强制无水印模式开启，但去水印引擎不可用")
+            self._last_watermark_error = "去水印引擎不可用（strict_no_watermark=1）"
         return self._watermark_available
 
     async def _force_remove_watermark(self, output_path: str) -> bool:
@@ -479,9 +562,11 @@ class ConcurrentImageGenerator:
         src = Path(output_path)
         if not src.exists():
             return False
+        self._last_watermark_error = ""
         if not await self._ensure_watermark_remover():
             return False
         if not self._watermark_remover:
+            self._last_watermark_error = "去水印实例未初始化"
             return False
 
         tmp_path = src.with_suffix(".clean.tmp.jpg")
@@ -493,6 +578,7 @@ class ConcurrentImageGenerator:
                 margin_ratio=self.watermark_cleanup_margin,
             )
             if not ok or not tmp_path.exists():
+                self._last_watermark_error = "去水印处理返回失败"
                 return False
 
             tmp_path.replace(src)
@@ -500,6 +586,7 @@ class ConcurrentImageGenerator:
             return True
         except Exception as e:
             logger.error("强制去水印失败: %s", e)
+            self._last_watermark_error = str(e)
             return False
         finally:
             if tmp_path.exists():

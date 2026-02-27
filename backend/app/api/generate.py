@@ -101,10 +101,13 @@ async def _async_batch_generate(batch_id: str, engine: str):
             img_id: {**info, "progress": 0}
             for img_id, info in image_task_map.items()
         }
+        reason_stats: dict[str, int] = {}
+        quota_alerted = False
 
         ps.init(TASK_TYPE, batch_id, total,
                 f"开始批量生图: {total} 个任务, 引擎={engine}",
-                per_image=per_image)
+                per_image=per_image,
+                reason_stats=reason_stats)
 
         generator = ConcurrentImageGenerator(
             api_key=api_key,
@@ -126,7 +129,7 @@ async def _async_batch_generate(batch_id: str, engine: str):
         sem = asyncio.Semaphore(10)
 
         async def process_task(task_obj):
-            nonlocal completed_count, failed_count
+            nonlocal completed_count, failed_count, quota_alerted
             if ps.is_cancel_requested(TASK_TYPE, batch_id):
                 return
 
@@ -163,7 +166,7 @@ async def _async_batch_generate(batch_id: str, engine: str):
 
                     task_engine = engine or t.ai_engine or settings.IMAGE_GENERATION_ENGINE
 
-                    success = await generator.generate_single_with_retry(
+                    success, fail_detail, fail_codes = await generator.generate_single_with_retry_detail(
                         engine=task_engine,
                         prompt=t.prompt or "",
                         negative_prompt=t.negative_prompt or "",
@@ -201,6 +204,9 @@ async def _async_batch_generate(batch_id: str, engine: str):
 
                         pi = per_image.get(img_id, {})
                         pi["failed"] = pi.get("failed", 0) + 1
+                        if fail_codes:
+                            for code in fail_codes:
+                                reason_stats[code] = reason_stats.get(code, 0) + 1
 
                     task_db.commit()
 
@@ -220,9 +226,19 @@ async def _async_batch_generate(batch_id: str, engine: str):
                     "completed": completed_count,
                     "failed": failed_count,
                     "per_image": per_image,
+                    "reason_stats": reason_stats,
                 })
                 logs = current.get("logs", [])
-                logs.append(f"{status_str} {ct_name}-{task_obj.style_name}")
+                if success:
+                    logs.append(f"{status_str} {ct_name}-{task_obj.style_name}")
+                else:
+                    detail = fail_detail or "未知失败"
+                    logs.append(f"{status_str} {ct_name}-{task_obj.style_name} | {detail}")
+                    if ("insufficient_user_quota" in (fail_codes or [])) and (not quota_alerted):
+                        logs.append(
+                            "[ALERT] 检测到上游额度不足（insufficient_user_quota）：请充值 API易 或更换可用 Key 后再重试。"
+                        )
+                        quota_alerted = True
                 current["logs"] = logs
                 ps.set(TASK_TYPE, batch_id, current)
 
@@ -244,6 +260,7 @@ async def _async_batch_generate(batch_id: str, engine: str):
                 failed_count,
                 f"批量生图已中断：已完成 {completed_count}，失败 {failed_count}，剩余任务保留为待处理",
                 per_image=per_image,
+                reason_stats=reason_stats,
             )
             return
 
@@ -253,9 +270,25 @@ async def _async_batch_generate(batch_id: str, engine: str):
             batch.status = "completed" if failed_count == 0 else "ongoing"
             db.commit()
 
-        ps.finish(TASK_TYPE, batch_id, completed_count, failed_count,
-                  f"批量生图完成！成功 {completed_count} 张，失败 {failed_count} 张",
-                  per_image=per_image)
+        summary = (
+            "批量生图完成！成功 "
+            f"{completed_count} 张，失败 {failed_count} 张"
+        )
+        if reason_stats:
+            detail = ", ".join(
+                [f"{k}={v}" for k, v in sorted(reason_stats.items(), key=lambda x: (-x[1], x[0]))]
+            )
+            summary += f" | 失败原因统计: {detail}"
+
+        ps.finish(
+            TASK_TYPE,
+            batch_id,
+            completed_count,
+            failed_count,
+            summary,
+            per_image=per_image,
+            reason_stats=reason_stats,
+        )
 
     except Exception as e:
         logger.error(f"批量生图失败 {batch_id}: {e}")
