@@ -109,11 +109,19 @@ class PromptGenerateRequest(BaseModel):
     """提示词生成请求"""
     batch_id: str
     crowd_types: Optional[List[str]] = Field(None, description="指定人群类型，不指定则全部")
+    base_image_id: Optional[str] = Field(None, description="指定底图ID，不指定则为所有底图生成")
 
     @field_validator("batch_id")
     @classmethod
     def _batch_id(cls, v: str) -> str:
         return _check_uuid(v, "batch_id")
+
+    @field_validator("base_image_id")
+    @classmethod
+    def _base_image_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            return _check_uuid(v, "base_image_id")
+        return v
 
     @field_validator("crowd_types")
     @classmethod

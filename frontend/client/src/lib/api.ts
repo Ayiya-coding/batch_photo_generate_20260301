@@ -236,6 +236,7 @@ export const preprocessApi = {
 
 export interface PromptItem {
   id: string;
+  base_image_id: string | null;
   crowd_type: string;
   crowd_name: string;
   style_name: string;
@@ -248,9 +249,13 @@ export interface PromptItem {
 
 export const promptApi = {
   /** 一键生成提示词 */
-  generate(batchId: string, crowdTypes?: string[]) {
-    return unwrapWithRetry<{ batch_id: string; crowd_types_count: number }>(() =>
-      http.post(API.prompt.generate, { batch_id: batchId, crowd_types: crowdTypes }),
+  generate(batchId: string, crowdTypes?: string[], baseImageId?: string) {
+    return unwrapWithRetry<{ batch_id: string; crowd_types_count: number; base_image_id?: string }>(() =>
+      http.post(API.prompt.generate, {
+        batch_id: batchId,
+        crowd_types: crowdTypes,
+        base_image_id: baseImageId
+      }),
     );
   },
 
@@ -265,7 +270,7 @@ export const promptApi = {
   },
 
   /** 获取提示词列表 */
-  list(params?: { batch_id?: string; crowd_type?: string }) {
+  list(params?: { batch_id?: string; base_image_id?: string; crowd_type?: string }) {
     return unwrap<{ prompts: PromptItem[]; total: number }>(
       http.get(API.prompt.list, { params }),
     );
@@ -287,6 +292,11 @@ export const promptApi = {
   /** 删除提示词 */
   delete(promptId: string) {
     return unwrap(http.delete(API.prompt.delete(promptId)));
+  },
+
+  /** 批量删除提示词 */
+  batchDelete(params: { batch_id?: string; base_image_id?: string; crowd_type?: string }) {
+    return unwrap(http.delete(API.prompt.batchDelete, { params }));
   },
 };
 

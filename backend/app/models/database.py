@@ -114,6 +114,7 @@ class PromptTemplate(Base):
     __tablename__ = "prompt_templates"
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    base_image_id = Column(String(36), ForeignKey("base_images.id"), nullable=True, index=True)  # 关联底图，nullable用于兼容旧数据
     crowd_type = Column(String(50), nullable=False, index=True)
     style_name = Column(String(255), nullable=False)
     positive_prompt = Column(Text, nullable=False)

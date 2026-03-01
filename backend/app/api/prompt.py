@@ -25,17 +25,17 @@ router = APIRouter()
 TASK_TYPE = "prompt"
 
 
-def _run_prompt_gen_background(batch_id: str, crowd_type_ids: list):
+def _run_prompt_gen_background(batch_id: str, crowd_type_ids: list, base_image_id: Optional[str] = None):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_async_generate_prompts(batch_id, crowd_type_ids))
+        loop.run_until_complete(_async_generate_prompts(batch_id, crowd_type_ids, base_image_id))
     finally:
         loop.close()
 
 
-async def _async_generate_prompts(batch_id: str, crowd_type_ids: list):
-    """异步批量生成提示词 — 分两阶段：1) 调API生成模板 2) 为所有底图创建任务"""
+async def _async_generate_prompts(batch_id: str, crowd_type_ids: list, base_image_id: Optional[str] = None):
+    """异步批量生成提示词 — 为每张底图生成独立的提示词模板"""
     db = SessionLocal()
     try:
         from app.services.prompt_generator import PromptGenerator, DEFAULT_STYLES
@@ -48,40 +48,36 @@ async def _async_generate_prompts(batch_id: str, crowd_type_ids: list):
         )
         generator = PromptGenerator(api_key=api_key, system_prompt=system_prompt)
 
-        base_images = db.query(BaseImage).filter(
+        # 获取底图列表（如果指定了base_image_id则只处理该底图）
+        query = db.query(BaseImage).filter(
             BaseImage.batch_id == batch_id,
             BaseImage.status == "completed"
-        ).all()
+        )
+        if base_image_id:
+            query = query.filter(BaseImage.id == base_image_id)
+
+        base_images = query.all()
 
         if not base_images:
             ps.fail(TASK_TYPE, batch_id, "没有已完成预处理的底图")
             return
 
         styles = DEFAULT_STYLES
-        template_count = len(crowd_type_ids) * len(styles)
-        task_count = len(base_images) * template_count
+        template_count_per_image = len(crowd_type_ids) * len(styles)
+        total_template_count = len(base_images) * template_count_per_image
 
-        ps.init(TASK_TYPE, batch_id, template_count,
-                f"阶段1: 生成提示词模板 ({len(crowd_type_ids)} 类型 × {len(styles)} 风格 = {template_count} 条)")
+        ps.init(TASK_TYPE, batch_id, total_template_count,
+                f"为 {len(base_images)} 张底图生成提示词 ({len(crowd_type_ids)} 类型 × {len(styles)} 风格 × {len(base_images)} 图 = {total_template_count} 条)")
         ps.append_log(TASK_TYPE, batch_id,
-                      f"阶段2: 为 {len(base_images)} 张底图创建生成任务 (共 {task_count} 个)")
+                      f"同时创建对应的生成任务")
 
-        # ===== 阶段1: 调用百炼API生成提示词模板 =====
+        # ===== 为每张底图生成独立的提示词模板 =====
         completed_count = 0
         failed_count = 0
         current_idx = 0
 
-        for ct_id in crowd_type_ids:
-            if ps.is_cancel_requested(TASK_TYPE, batch_id):
-                ps.cancel(
-                    TASK_TYPE,
-                    batch_id,
-                    completed_count,
-                    failed_count,
-                    f"提示词生成已中断：已完成 {completed_count}，失败 {failed_count}",
-                )
-                return
-            for style in styles:
+        for img in base_images:
+            for ct_id in crowd_type_ids:
                 if ps.is_cancel_requested(TASK_TYPE, batch_id):
                     ps.cancel(
                         TASK_TYPE,
@@ -91,111 +87,78 @@ async def _async_generate_prompts(batch_id: str, crowd_type_ids: list):
                         f"提示词生成已中断：已完成 {completed_count}，失败 {failed_count}",
                     )
                     return
-                current_idx += 1
-                try:
-                    positive, negative = await generator.generate_single(ct_id, style)
-
-                    existing = db.query(PromptTemplate).filter(
-                        PromptTemplate.crowd_type == ct_id,
-                        PromptTemplate.style_name == style["name"],
-                    ).first()
-
-                    if existing:
-                        existing.positive_prompt = positive
-                        existing.negative_prompt = negative
-                    else:
-                        db.add(PromptTemplate(
-                            crowd_type=ct_id,
-                            style_name=style["name"],
-                            positive_prompt=positive,
-                            negative_prompt=negative,
-                        ))
-
-                    completed_count += 1
-                    ps.append_log(TASK_TYPE, batch_id,
-                                  f"[OK] {CROWD_TYPES.get(ct_id, ct_id)}-{style['name']}")
-
-                except Exception as e:
-                    logger.error(f"提示词生成失败 {ct_id}-{style['name']}: {e}")
-                    failed_count += 1
-                    ps.append_log(TASK_TYPE, batch_id,
-                                  f"[FAIL] {CROWD_TYPES.get(ct_id, ct_id)}-{style['name']}: {str(e)[:50]}")
-
-                db.commit()
-
-                progress = int(current_idx / template_count * 80)  # 阶段1占80%进度
-                ps.update(TASK_TYPE, batch_id,
-                          progress=progress, completed=completed_count, failed=failed_count)
-
-                await asyncio.sleep(0.3)
-
-        # ===== 阶段2: 为所有底图创建 GenerateTask =====
-        ps.append_log(TASK_TYPE, batch_id,
-                      f"提示词模板完成，正在为 {len(base_images)} 张底图创建生成任务...")
-
-        # 保护：移除“当前选中人群之外”的待生成任务，避免误触发后继续跑95任务
-        stale_task_ids = [
-            row[0]
-            for row in db.query(GenerateTask.id).join(BaseImage).filter(
-                BaseImage.batch_id == batch_id,
-                ~GenerateTask.crowd_type.in_(crowd_type_ids),
-                GenerateTask.status.in_(["pending", "failed", "processing"]),
-            ).all()
-        ]
-        if stale_task_ids:
-            db.query(GenerateTask).filter(GenerateTask.id.in_(stale_task_ids)).delete(
-                synchronize_session=False
-            )
-            db.commit()
-            ps.append_log(
-                TASK_TYPE,
-                batch_id,
-                f"[CLEANUP] 已清理非当前人群的遗留任务 {len(stale_task_ids)} 条",
-            )
-
-        templates = db.query(PromptTemplate).filter(
-            PromptTemplate.crowd_type.in_(crowd_type_ids),
-            PromptTemplate.is_active == True,
-        ).all()
-
-        template_map = {(t.crowd_type, t.style_name): t for t in templates}
-        tasks_created = 0
-
-        for img in base_images:
-            if ps.is_cancel_requested(TASK_TYPE, batch_id):
-                ps.cancel(
-                    TASK_TYPE,
-                    batch_id,
-                    completed_count,
-                    failed_count,
-                    f"提示词生成已中断：已完成 {completed_count}，失败 {failed_count}，已保留已创建任务",
-                )
-                return
-            for ct_id in crowd_type_ids:
                 for style in styles:
-                    existing_task = db.query(GenerateTask).filter(
-                        GenerateTask.base_image_id == img.id,
-                        GenerateTask.crowd_type == ct_id,
-                        GenerateTask.style_name == style["name"],
-                    ).first()
+                    if ps.is_cancel_requested(TASK_TYPE, batch_id):
+                        ps.cancel(
+                            TASK_TYPE,
+                            batch_id,
+                            completed_count,
+                            failed_count,
+                            f"提示词生成已中断：已完成 {completed_count}，失败 {failed_count}",
+                        )
+                        return
+                    current_idx += 1
+                    try:
+                        positive, negative = await generator.generate_single(ct_id, style)
 
-                    if not existing_task:
-                        tmpl = template_map.get((ct_id, style["name"]))
-                        db.add(GenerateTask(
-                            base_image_id=img.id,
-                            crowd_type=ct_id,
-                            style_name=style["name"],
-                            prompt=tmpl.positive_prompt if tmpl else "",
-                            negative_prompt=tmpl.negative_prompt if tmpl else "",
-                            ai_engine=default_generate_engine,
-                            status="pending",
-                        ))
-                        tasks_created += 1
+                        # 检查该底图是否已有该提示词
+                        existing = db.query(PromptTemplate).filter(
+                            PromptTemplate.base_image_id == img.id,
+                            PromptTemplate.crowd_type == ct_id,
+                            PromptTemplate.style_name == style["name"],
+                        ).first()
 
-            db.commit()
+                        if existing:
+                            existing.positive_prompt = positive
+                            existing.negative_prompt = negative
+                            existing.is_active = True
+                        else:
+                            db.add(PromptTemplate(
+                                base_image_id=img.id,
+                                crowd_type=ct_id,
+                                style_name=style["name"],
+                                positive_prompt=positive,
+                                negative_prompt=negative,
+                            ))
+
+                        # 同时创建或更新 GenerateTask
+                        existing_task = db.query(GenerateTask).filter(
+                            GenerateTask.base_image_id == img.id,
+                            GenerateTask.crowd_type == ct_id,
+                            GenerateTask.style_name == style["name"],
+                        ).first()
+
+                        if not existing_task:
+                            db.add(GenerateTask(
+                                base_image_id=img.id,
+                                crowd_type=ct_id,
+                                style_name=style["name"],
+                                prompt=positive,
+                                negative_prompt=negative,
+                                ai_engine=default_generate_engine,
+                                status="pending",
+                            ))
+
+                        completed_count += 1
+                        ps.append_log(TASK_TYPE, batch_id,
+                                      f"[OK] {img.filename[:20]}-{CROWD_TYPES.get(ct_id, ct_id)}-{style['name']}")
+
+                    except Exception as e:
+                        logger.error(f"提示词生成失败 {img.id}-{ct_id}-{style['name']}: {e}")
+                        failed_count += 1
+                        ps.append_log(TASK_TYPE, batch_id,
+                                      f"[FAIL] {img.filename[:20]}-{CROWD_TYPES.get(ct_id, ct_id)}-{style['name']}: {str(e)[:50]}")
+
+                    db.commit()
+
+                    progress = int(current_idx / total_template_count * 100)
+                    ps.update(TASK_TYPE, batch_id,
+                              progress=progress, completed=completed_count, failed=failed_count)
+
+                    await asyncio.sleep(0.3)
 
         ps.finish(TASK_TYPE, batch_id, completed_count, failed_count,
-                  f"全部完成！生成 {completed_count} 条提示词模板，创建 {tasks_created} 个生成任务，失败 {failed_count} 条")
+                  f"全部完成！为 {len(base_images)} 张底图生成 {completed_count} 条提示词，失败 {failed_count} 条")
 
     except Exception as e:
         logger.error(f"提示词生成批次失败 {batch_id}: {e}")
@@ -207,9 +170,10 @@ async def _async_generate_prompts(batch_id: str, crowd_type_ids: list):
 @router.post("/generate", response_model=BaseResponse)
 async def generate_prompts(request: PromptGenerateRequest, db: Session = Depends(get_db)):
     """
-    一键生成全部类型提示词（异步后台任务）
-    - 19种人群类型 × 5种风格 = 95 条提示词模板
-    - 为每张底图创建对应的 GenerateTask
+    一键生成提示词（异步后台任务）
+    - 为指定底图生成提示词（不指定则为所有底图生成）
+    - 每张底图独立生成提示词模板
+    - 同时创建对应的 GenerateTask
     """
     from app.models.database import Batch
     batch = db.query(Batch).filter(Batch.id == request.batch_id).first()
@@ -227,7 +191,7 @@ async def generate_prompts(request: PromptGenerateRequest, db: Session = Depends
 
     t = threading.Thread(
         target=_run_prompt_gen_background,
-        args=(request.batch_id, crowd_type_ids),
+        args=(request.batch_id, crowd_type_ids, request.base_image_id),
         daemon=True,
     )
     ps.clear_cancel(TASK_TYPE, request.batch_id)
@@ -236,6 +200,7 @@ async def generate_prompts(request: PromptGenerateRequest, db: Session = Depends
     return BaseResponse(code=0, message="提示词生成已启动", data={
         "batch_id": request.batch_id,
         "crowd_types_count": len(crowd_type_ids),
+        "base_image_id": request.base_image_id,
     })
 
 
@@ -257,15 +222,22 @@ async def cancel_prompt_generation(batch_id: str):
 @router.get("/list", response_model=BaseResponse)
 async def list_prompts(
     batch_id: Optional[str] = None,
+    base_image_id: Optional[str] = None,
     crowd_type: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     """
     查看提示词列表
+    - 必须指定 base_image_id 来查询某张底图的提示词
     - 可按人群类型筛选
     - 返回提示词模板 + 关联的生成任务数
     """
     query = db.query(PromptTemplate).filter(PromptTemplate.is_active == True)
+
+    # 必须指定 base_image_id
+    if base_image_id:
+        query = query.filter(PromptTemplate.base_image_id == base_image_id)
+
     if crowd_type:
         query = query.filter(PromptTemplate.crowd_type == crowd_type)
 
@@ -275,14 +247,16 @@ async def list_prompts(
     for t in templates:
         # 统计关联的待生成任务数
         task_count = 0
-        if batch_id:
+        if t.base_image_id:
             task_count = db.query(GenerateTask).filter(
+                GenerateTask.base_image_id == t.base_image_id,
                 GenerateTask.crowd_type == t.crowd_type,
                 GenerateTask.style_name == t.style_name,
-            ).join(BaseImage).filter(BaseImage.batch_id == batch_id).count()
+            ).count()
 
         result.append({
             "id": t.id,
+            "base_image_id": t.base_image_id,
             "crowd_type": t.crowd_type,
             "crowd_name": CROWD_TYPES.get(t.crowd_type, t.crowd_type),
             "style_name": t.style_name,
@@ -336,3 +310,43 @@ async def delete_prompt(prompt_id: str, db: Session = Depends(get_db)):
     template.is_active = False
     db.commit()
     return BaseResponse(code=0, message="提示词已删除")
+
+
+@router.delete("/batch-delete", response_model=BaseResponse)
+async def batch_delete_prompts(
+    batch_id: Optional[str] = None,
+    base_image_id: Optional[str] = None,
+    crowd_type: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    批量删除提示词（软删除）
+
+    删除粒度：
+    - 传 base_image_id + crowd_type: 删除该底图该人群类型的所有提示词
+    - 传 base_image_id: 删除该底图的所有提示词
+    - 传 batch_id: 删除整个批次所有底图的所有提示词
+    """
+    query = db.query(PromptTemplate).filter(PromptTemplate.is_active == True)
+
+    if base_image_id and crowd_type:
+        # 删除指定底图的指定人群类型
+        query = query.filter(
+            PromptTemplate.base_image_id == base_image_id,
+            PromptTemplate.crowd_type == crowd_type
+        )
+    elif base_image_id:
+        # 删除指定底图的所有提示词
+        query = query.filter(PromptTemplate.base_image_id == base_image_id)
+    elif batch_id:
+        # 删除整个批次的所有提示词（通过 base_images 表关联）
+        base_image_ids = db.query(BaseImage.id).filter(BaseImage.batch_id == batch_id).all()
+        image_id_list = [id[0] for id in base_image_ids]
+        query = query.filter(PromptTemplate.base_image_id.in_(image_id_list))
+    else:
+        raise HTTPException(status_code=400, detail="至少需要提供一个过滤条件")
+
+    count = query.update({"is_active": False}, synchronize_session=False)
+    db.commit()
+
+    return BaseResponse(code=0, message=f"已删除 {count} 条提示词")

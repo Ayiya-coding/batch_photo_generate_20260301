@@ -8,7 +8,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { toast } from "sonner";
 import {
   Wand2, Save, ChevronRight, ChevronDown,
-  Trash2, Edit3, Sparkles, RefreshCw, ImageIcon, Loader2, Pause,
+  Trash2, Edit3, Sparkles, RefreshCw, ImageIcon, Loader2, Pause, X, MoreVertical,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useUpload } from "@/contexts/UploadContext";
@@ -16,6 +16,13 @@ import {
   uploadApi, promptApi, toFileUrl,
   type PromptItem, type ProgressInfo,
 } from "@/lib/api";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 
 // ========== 类型 & 常量 ==========
 
@@ -74,8 +81,8 @@ export default function PromptConfig() {
   const [images, setImages] = useState<BaseImageInfo[]>([]);
   const [selectedImageId, setSelectedImageId] = useState<string>("");
 
-  // --- 提示词数据 ---
-  const [promptMap, setPromptMap] = useState<Record<string, PromptItem[]>>({});
+  // --- 提示词数据（三维结构：base_image_id → crowd_type → PromptItem[]）---
+  const [promptMap, setPromptMap] = useState<Record<string, Record<string, PromptItem[]>>>({});
   const [expandedType, setExpandedType] = useState<string | null>("C02");
   const [editingId, setEditingId] = useState<string | null>(null);
 
@@ -124,17 +131,20 @@ export default function PromptConfig() {
   // ========== 初始化：加载提示词列表 ==========
 
   const loadPrompts = useCallback(async () => {
-    if (!batchId) {
+    if (!batchId || !selectedImageId) {
       setPromptMap({});
       return;
     }
     setLoadingPrompts(true);
-    const result = await promptApi.list({ batch_id: batchId! });
+    const result = await promptApi.list({ batch_id: batchId!, base_image_id: selectedImageId });
     if (result) {
-      setPromptMap(groupByCrowdType(result.prompts));
+      setPromptMap((prev) => ({
+        ...prev,
+        [selectedImageId]: groupByCrowdType(result.prompts),
+      }));
     }
     setLoadingPrompts(false);
-  }, [batchId]);
+  }, [batchId, selectedImageId]);
 
   useEffect(() => {
     loadPrompts();
@@ -201,11 +211,15 @@ export default function PromptConfig() {
       toast.info("请先选择一个人群类型");
       return;
     }
+    if (!selectedImageId) {
+      toast.info("请先选择一张底图");
+      return;
+    }
 
     setIsGenerating(true);
     setGenProgress(null);
 
-    const result = await promptApi.generate(batchId!, [expandedType]);
+    const result = await promptApi.generate(batchId!, [expandedType], selectedImageId);
     if (!result) {
       setIsGenerating(false);
       return;
@@ -228,7 +242,7 @@ export default function PromptConfig() {
     } else {
       toast.error("提示词生成失败或超时");
     }
-  }, [batchId, expandedType, pollGenerateProgress, loadPrompts]);
+  }, [batchId, expandedType, selectedImageId, pollGenerateProgress, loadPrompts]);
 
   // ========== 为单个人群类型重新生成 ==========
 
@@ -237,11 +251,15 @@ export default function PromptConfig() {
       toast.info("演示模式：无法调用后端生成");
       return;
     }
+    if (!selectedImageId) {
+      toast.info("请先选择一张底图");
+      return;
+    }
 
     setIsGenerating(true);
     setGenProgress(null);
 
-    const result = await promptApi.generate(batchId!, [typeId]);
+    const result = await promptApi.generate(batchId!, [typeId], selectedImageId);
     if (!result) {
       setIsGenerating(false);
       return;
@@ -262,7 +280,7 @@ export default function PromptConfig() {
     } else {
       toast.error("重新生成失败或超时");
     }
-  }, [batchId, pollGenerateProgress, loadPrompts]);
+  }, [batchId, selectedImageId, pollGenerateProgress, loadPrompts]);
 
   const handleCancelGenerate = useCallback(async () => {
     if (!batchId) return;
@@ -276,13 +294,19 @@ export default function PromptConfig() {
 
   const handleUpdatePrompt = useCallback(
     (promptId: string, field: "positive_prompt" | "negative_prompt" | "style_name", value: string) => {
-      // 立即更新本地状态
+      // 立即更新本地状态（只更新当前选中的底图）
+      if (!selectedImageId) return;
+
       setPromptMap((prev) => {
         const next = { ...prev };
-        for (const key of Object.keys(next)) {
-          next[key] = next[key].map((p) =>
-            p.id === promptId ? { ...p, [field]: value } : p
-          );
+        if (next[selectedImageId]) {
+          const imagePrompts = { ...next[selectedImageId] };
+          for (const typeId of Object.keys(imagePrompts)) {
+            imagePrompts[typeId] = imagePrompts[typeId].map((p) =>
+              p.id === promptId ? { ...p, [field]: value } : p
+            );
+          }
+          next[selectedImageId] = imagePrompts;
         }
         return next;
       });
@@ -304,7 +328,7 @@ export default function PromptConfig() {
         }, 800);
       }
     },
-    [batchId],
+    [batchId, selectedImageId],
   );
 
   // ========== 手动保存（清空防抖队列） ==========
@@ -324,11 +348,76 @@ export default function PromptConfig() {
     if (batchId) {
       await promptApi.delete(promptId);
     }
-    setPromptMap((prev) => ({
-      ...prev,
-      [typeId]: (prev[typeId] || []).filter((p) => p.id !== promptId),
-    }));
+    setPromptMap((prev) => {
+      const next = { ...prev };
+      if (selectedImageId && next[selectedImageId]) {
+        next[selectedImageId] = {
+          ...next[selectedImageId],
+          [typeId]: (next[selectedImageId][typeId] || []).filter((p) => p.id !== promptId),
+        };
+      }
+      return next;
+    });
     toast.info("已删除提示词");
+  }, [batchId, selectedImageId]);
+
+  // ========== 批量删除提示词 ==========
+
+  const handleBatchDeleteCrowdType = useCallback(async (typeId: string) => {
+    if (!batchId || !selectedImageId) return;
+
+    const typeName = allTypes.find((t) => t.id === typeId)?.name || typeId;
+    const result = await promptApi.batchDelete({
+      batch_id: batchId,
+      base_image_id: selectedImageId,
+      crowd_type: typeId,
+    });
+
+    if (result !== undefined) {
+      setPromptMap((prev) => {
+        const next = { ...prev };
+        if (next[selectedImageId]) {
+          next[selectedImageId] = {
+            ...next[selectedImageId],
+            [typeId]: [],
+          };
+        }
+        return next;
+      });
+      toast.success(`已删除「${typeName}」的所有提示词`);
+    }
+  }, [batchId, selectedImageId]);
+
+  const handleBatchDeleteBaseImage = useCallback(async () => {
+    if (!batchId || !selectedImageId) return;
+
+    const img = images.find((i) => i.id === selectedImageId);
+    const result = await promptApi.batchDelete({
+      batch_id: batchId,
+      base_image_id: selectedImageId,
+    });
+
+    if (result !== undefined) {
+      setPromptMap((prev) => {
+        const next = { ...prev };
+        delete next[selectedImageId];
+        return next;
+      });
+      toast.success(`已删除底图「${img?.filename || ''}」的所有提示词`);
+    }
+  }, [batchId, selectedImageId, images]);
+
+  const handleBatchDeleteAll = useCallback(async () => {
+    if (!batchId) return;
+
+    const result = await promptApi.batchDelete({
+      batch_id: batchId,
+    });
+
+    if (result !== undefined) {
+      setPromptMap({});
+      toast.success("已删除所有提示词");
+    }
   }, [batchId]);
 
   // ========== 图片选择 ==========
@@ -343,8 +432,14 @@ export default function PromptConfig() {
 
   // ========== 辅助 ==========
 
-  const getTypePromptCount = (typeId: string) => promptMap[typeId]?.length || 0;
-  const currentPrompts = expandedType ? (promptMap[expandedType] || []) : [];
+  const getTypePromptCount = (typeId: string) => {
+    if (!selectedImageId || !promptMap[selectedImageId]) return 0;
+    return promptMap[selectedImageId][typeId]?.length || 0;
+  };
+
+  const currentPrompts = expandedType && selectedImageId && promptMap[selectedImageId]
+    ? (promptMap[selectedImageId][expandedType] || [])
+    : [];
 
   // ========== 渲染 ==========
 
@@ -436,7 +531,37 @@ export default function PromptConfig() {
         {/* 中间：人群类型选择 */}
         <Card className="w-[280px] shrink-0 flex flex-col">
           <CardHeader className="py-2 shrink-0">
-            <CardTitle className="text-base">人群类型</CardTitle>
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-base">人群类型</CardTitle>
+              {selectedImageId && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7"
+                      title="批量删除"
+                    >
+                      <MoreVertical className="w-4 h-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem onClick={handleBatchDeleteBaseImage}>
+                      <Trash2 className="w-4 h-4 mr-2" />
+                      删除当前底图的所有提示词
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      onClick={handleBatchDeleteAll}
+                      variant="destructive"
+                    >
+                      <Trash2 className="w-4 h-4 mr-2" />
+                      删除所有底图的所有提示词
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+            </div>
           </CardHeader>
           <CardContent className="p-0 flex-1 overflow-hidden">
             <ScrollArea className="h-full">
@@ -450,23 +575,40 @@ export default function PromptConfig() {
                       <div
                         key={type.id}
                         className={cn(
-                          "flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-colors",
+                          "flex items-center gap-2 px-3 py-2 rounded-lg transition-colors group",
                           expandedType === type.id ? "bg-accent" : "hover:bg-muted"
                         )}
-                        onClick={() => setExpandedType(expandedType === type.id ? null : type.id)}
                       >
-                        <div className="flex-1">
-                          <div className="flex items-center justify-between">
-                            <span className="text-sm font-medium">{type.name}</span>
-                            <span className="text-xs text-muted-foreground">
-                              {getTypePromptCount(type.id)} 个
-                            </span>
+                        <div
+                          className="flex-1 flex items-center gap-3 cursor-pointer"
+                          onClick={() => setExpandedType(expandedType === type.id ? null : type.id)}
+                        >
+                          <div className="flex-1">
+                            <div className="flex items-center justify-between">
+                              <span className="text-sm font-medium">{type.name}</span>
+                              <span className="text-xs text-muted-foreground">
+                                {getTypePromptCount(type.id)} 个
+                              </span>
+                            </div>
                           </div>
+                          {expandedType === type.id ? (
+                            <ChevronDown className="w-4 h-4 text-muted-foreground" />
+                          ) : (
+                            <ChevronRight className="w-4 h-4 text-muted-foreground" />
+                          )}
                         </div>
-                        {expandedType === type.id ? (
-                          <ChevronDown className="w-4 h-4 text-muted-foreground" />
-                        ) : (
-                          <ChevronRight className="w-4 h-4 text-muted-foreground" />
+                        {getTypePromptCount(type.id) > 0 && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleBatchDeleteCrowdType(type.id);
+                            }}
+                          >
+                            <Trash2 className="w-3 h-3 text-destructive" />
+                          </Button>
                         )}
                       </div>
                     ))}
@@ -484,23 +626,40 @@ export default function PromptConfig() {
                       <div
                         key={type.id}
                         className={cn(
-                          "flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-colors",
+                          "flex items-center gap-2 px-3 py-2 rounded-lg transition-colors group",
                           expandedType === type.id ? "bg-accent" : "hover:bg-muted"
                         )}
-                        onClick={() => setExpandedType(expandedType === type.id ? null : type.id)}
                       >
-                        <div className="flex-1">
-                          <div className="flex items-center justify-between">
-                            <span className="text-sm font-medium">{type.name}</span>
-                            <span className="text-xs text-muted-foreground">
-                              {getTypePromptCount(type.id)} 个
-                            </span>
+                        <div
+                          className="flex-1 flex items-center gap-3 cursor-pointer"
+                          onClick={() => setExpandedType(expandedType === type.id ? null : type.id)}
+                        >
+                          <div className="flex-1">
+                            <div className="flex items-center justify-between">
+                              <span className="text-sm font-medium">{type.name}</span>
+                              <span className="text-xs text-muted-foreground">
+                                {getTypePromptCount(type.id)} 个
+                              </span>
+                            </div>
                           </div>
+                          {expandedType === type.id ? (
+                            <ChevronDown className="w-4 h-4 text-muted-foreground" />
+                          ) : (
+                            <ChevronRight className="w-4 h-4 text-muted-foreground" />
+                          )}
                         </div>
-                        {expandedType === type.id ? (
-                          <ChevronDown className="w-4 h-4 text-muted-foreground" />
-                        ) : (
-                          <ChevronRight className="w-4 h-4 text-muted-foreground" />
+                        {getTypePromptCount(type.id) > 0 && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleBatchDeleteCrowdType(type.id);
+                            }}
+                          >
+                            <Trash2 className="w-3 h-3 text-destructive" />
+                          </Button>
                         )}
                       </div>
                     ))}
@@ -522,6 +681,17 @@ export default function PromptConfig() {
               </CardTitle>
               {expandedType && (
                 <div className="flex gap-2">
+                  {getTypePromptCount(expandedType) > 0 && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8"
+                      onClick={() => handleBatchDeleteCrowdType(expandedType)}
+                      title="删除当前人群类型的所有提示词"
+                    >
+                      <Trash2 className="w-4 h-4 text-destructive" />
+                    </Button>
+                  )}
                   <Button
                     variant="outline"
                     size="sm"
