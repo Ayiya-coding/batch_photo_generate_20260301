@@ -55,7 +55,83 @@ def _smooth_seam_band(image: np.ndarray, y0: int, y1: int, x0: int, x1: int):
     band = image[ys:ye, xs:xe]
     if band.size == 0:
         return
-    image[ys:ye, xs:xe] = cv2.GaussianBlur(band, (0, 0), sigmaX=0.8, sigmaY=0.8)
+    image[ys:ye, xs:xe] = cv2.GaussianBlur(band, (0, 0), sigmaX=1.1, sigmaY=1.1)
+
+
+def _feather_blend_source_patch(
+    result_image: np.ndarray,
+    source_patch: np.ndarray,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+    feather: int,
+):
+    """
+    将原图 patch 以羽化方式贴回扩图结果，降低硬边和锯齿缝。
+    """
+    patch_h = y1 - y0
+    patch_w = x1 - x0
+    if patch_h <= 0 or patch_w <= 0:
+        return
+
+    # 1) 基础 alpha: 源 patch 区域=1
+    alpha = np.zeros(result_image.shape[:2], dtype=np.float32)
+    alpha[y0:y1, x0:x1] = 1.0
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=max(1.0, feather * 0.45), sigmaY=max(1.0, feather * 0.45))
+
+    # 2) 强制中心区域完全使用原图，避免主体被污染
+    core_margin = min(max(4, feather * 2), max(4, min(patch_h, patch_w) // 4))
+    cy0 = min(y1, y0 + core_margin)
+    cy1 = max(y0, y1 - core_margin)
+    cx0 = min(x1, x0 + core_margin)
+    cx1 = max(x0, x1 - core_margin)
+    if cy0 < cy1 and cx0 < cx1:
+        alpha[cy0:cy1, cx0:cx1] = 1.0
+
+    overlay = np.zeros_like(result_image)
+    overlay[y0:y1, x0:x1] = source_patch
+
+    a3 = alpha[..., None]
+    blended = overlay.astype(np.float32) * a3 + result_image.astype(np.float32) * (1.0 - a3)
+    np.copyto(result_image, blended.astype(np.uint8))
+
+
+def _smooth_expanded_regions(
+    image: np.ndarray,
+    y0: int,
+    y1: int,
+    x0: int,
+    x1: int,
+):
+    """
+    对扩展区做轻量去条纹与抗锯齿处理，不触碰主体区域。
+    """
+    h, w = image.shape[:2]
+
+    def _blend_region(region: np.ndarray, kx: int, ky: int, alpha: float):
+        if region.size == 0:
+            return region
+        blur = cv2.GaussianBlur(region, (kx, ky), 0)
+        out = cv2.addWeighted(region, 1.0 - alpha, blur, alpha, 0)
+        return out
+
+    # 顶部扩展区
+    if y0 > 0:
+        top = image[:y0, :]
+        image[:y0, :] = _blend_region(top, 15, 3, 0.28)
+    # 底部扩展区
+    if y1 < h:
+        bottom = image[y1:, :]
+        image[y1:, :] = _blend_region(bottom, 15, 3, 0.28)
+    # 左侧扩展区
+    if x0 > 0:
+        left = image[:, :x0]
+        image[:, :x0] = _blend_region(left, 3, 15, 0.22)
+    # 右侧扩展区
+    if x1 < w:
+        right = image[:, x1:]
+        image[:, x1:] = _blend_region(right, 3, 15, 0.22)
 
 
 def _postprocess_outpaint_result(
@@ -89,9 +165,20 @@ def _postprocess_outpaint_result(
     x1 = min(target_width, x0 + src_w)
 
     src_crop = source_image[: y1 - y0, : x1 - x0]
-    result_image[y0:y1, x0:x1] = src_crop
+    seam = max(4, min(22, min(src_h, src_w) // 28))
 
-    seam = max(2, min(10, min(src_h, src_w) // 50))
+    # 先对扩展区做去条纹，再羽化回贴源图
+    _smooth_expanded_regions(result_image, y0, y1, x0, x1)
+    _feather_blend_source_patch(
+        result_image=result_image,
+        source_patch=src_crop,
+        y0=y0,
+        y1=y1,
+        x0=x0,
+        x1=x1,
+        feather=seam,
+    )
+
     if pad_top > 0:
         _smooth_seam_band(result_image, y0 - seam, y0 + seam, x0, x1)
     if pad_bottom > 0:

@@ -66,6 +66,57 @@ def _crowd_fashion_hint(crowd_type_id: str) -> str:
         return "age styling: graceful senior elegance, comfortable premium fabrics, refined classic details"
     return "age styling: fit clothing style to the target crowd age and identity"
 
+
+def _recommended_outfit_pack(crowd_type_id: str, season: str) -> str:
+    season_token = {
+        "spring": "spring",
+        "summer": "summer",
+        "autumn": "autumn",
+        "winter": "winter",
+    }.get(season, "current season")
+
+    if crowd_type_id in {"C01", "C05"}:
+        packs = [
+            f"{season_token} playful casual set",
+            "mini new-Chinese kid hanfu set",
+            "storybook princess/prince costume set",
+            "street sport mini set",
+            "festival photo outfit set",
+        ]
+    elif crowd_type_id in {"C02", "C06"}:
+        packs = [
+            f"{season_token} city casual look",
+            "smart business suit look",
+            "new-Chinese urban fusion look",
+            "retro formal look",
+            "outdoor travel check-in look",
+        ]
+    elif crowd_type_id in {"C03", "C07"}:
+        packs = [
+            f"{season_token} premium minimal look",
+            "tailored business/formal look",
+            "new-Chinese elegant look",
+            "retro classic evening look",
+            "resort-travel refined look",
+        ]
+    elif crowd_type_id == "C04":
+        packs = [
+            f"{season_token} graceful comfort look",
+            "classic cheongsam/han style look",
+            "refined knit + outerwear look",
+            "heritage elegant formal look",
+            "warm family-photo travel look",
+        ]
+    else:
+        packs = [
+            f"{season_token} trend casual look",
+            "smart formal look",
+            "new-Chinese style look",
+            "retro look",
+            "travel check-in look",
+        ]
+    return ", ".join(packs)
+
 # 人群类型详细描述（用于提示词生成）
 CROWD_DESCRIPTIONS = {
     "C01": "4-12岁女童，天真可爱，童趣活泼",
@@ -132,6 +183,7 @@ class PromptGenerator:
         season = _current_season()
         seasonal_hint = SEASONAL_TREND_HINTS.get(season, "")
         crowd_fashion = _crowd_fashion_hint(crowd_type_id)
+        outfit_pack = _recommended_outfit_pack(crowd_type_id, season)
         ref_block = f"\n参考底图特征：{reference_context}" if reference_context else ""
         variation_block = (
             f"\n造型变化方向：{style_variation_hint}"
@@ -144,18 +196,20 @@ class PromptGenerator:
             else ""
         )
         crowd_fashion_block = f"\n年龄段穿搭约束：{crowd_fashion}"
+        outfit_pack_block = f"\n该年龄段推荐穿搭清单（至少选其一落地）：{outfit_pack}"
         return f"""请为以下组合生成一个图像生成提示词：
 
 人群类型：{crowd_name}（{crowd_desc}）
 风格：{style['name']}（{style['desc']}）
-{ref_block}{variation_block}{trend_block}{crowd_fashion_block}
+{ref_block}{variation_block}{trend_block}{crowd_fashion_block}{outfit_pack_block}
 
 要求：
 - 输出英文正向提示词 + 负向提示词
 - 正向提示词和负向提示词用 "---NEGATIVE---" 分隔
 - 适合生成9:16比例的人物写真
 - 明确要求“仅参考底图背景（景点/光影/景色），不要继承底图人物脸和身份，按目标人群重建人物”
-- 明确要求“背景建筑与地标关系保持稳定，不要改换成其他景点”"""
+- 明确要求“背景建筑与地标关系保持稳定，不要改换成其他景点”
+- 强调“优先写清服装/发型/配饰/姿态，不要过度强调面部细节，确保后续换脸可用（无遮挡脸部）”"""
 
     async def generate_single(
         self,

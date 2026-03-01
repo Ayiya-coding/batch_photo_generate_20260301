@@ -107,7 +107,9 @@ def _build_task_prompt(base_prompt: str, style_name: str) -> str:
         "lighting consistent with the reference background. Keep the same landmark architecture and environment "
         "composition across all style variants. Replace the person identity and facial features with a "
         f"new subject that matches the target crowd and style '{style_name}'. Do not preserve the original face. "
-        "Avoid changing background layout, architecture, or scene structure."
+        "Avoid changing background layout, architecture, or scene structure. Prioritize outfit, hair styling, "
+        "accessories and pose over facial micro-details. Keep the face clearly visible and unobstructed for later "
+        "face swap (no mask, no sunglasses, no heavy hand-on-face occlusion)."
     )
     return f"{guard} {base}" if base else guard
 
@@ -118,7 +120,8 @@ def _build_task_negative_prompt(base_negative: str) -> str:
     """
     extra = (
         "same face as reference, same identity as reference person, lookalike clone face, "
-        "identity preserved from reference, background replaced, landmark changed, new location"
+        "identity preserved from reference, background replaced, landmark changed, new location, "
+        "face occluded, sunglasses, face mask, heavy bangs covering eyes, hand covering face, extreme face closeup"
     )
     base = (base_negative or "").strip()
     return f"{base}, {extra}" if base else extra
