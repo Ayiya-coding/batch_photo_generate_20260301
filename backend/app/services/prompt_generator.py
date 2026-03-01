@@ -7,6 +7,7 @@ import httpx
 import json
 import asyncio
 import logging
+from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
 from app.core.config import settings
@@ -17,13 +18,13 @@ logger = logging.getLogger(__name__)
 # 阿里百炼 OpenAI 兼容端点
 BAILIAN_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 
-# 默认5种风格定义
+# 默认5种风格定义（只描述人物穿搭与气质，不改变背景地点）
 DEFAULT_STYLES = [
-    {"name": "古典东方", "desc": "盛唐仕女风格，华丽的汉服，精致的发饰，古典园林背景"},
-    {"name": "古典西方", "desc": "文艺复兴风格，华丽的宫廷服饰，欧式宫殿背景"},
-    {"name": "现代都市", "desc": "时尚都市风格，现代服装，城市街景或咖啡厅背景"},
-    {"name": "自然清新", "desc": "自然田园风格，轻便服装，花田/森林/海边背景"},
-    {"name": "科幻未来", "desc": "赛博朋克风格，未来感服装，霓虹灯光都市背景"},
+    {"name": "古典东方", "desc": "新中式/汉服人物造型，强调衣料层次、发饰与仪态，不改背景场景"},
+    {"name": "古典西方", "desc": "复古欧式人物造型，强调礼服剪裁、珠宝配饰与气质，不改背景场景"},
+    {"name": "现代都市", "desc": "都市通勤与街拍穿搭，强调当季流行单品和妆发，不改背景场景"},
+    {"name": "自然清新", "desc": "轻户外与森系穿搭，强调舒适面料、轻妆和自然配色，不改背景场景"},
+    {"name": "科幻未来", "desc": "未来感潮流穿搭，强调材质光泽、配件与色彩点缀，不改背景场景"},
 ]
 
 # 人物造型多样化方向（同风格内也要有造型变化）
@@ -34,6 +35,36 @@ STYLE_VARIATION_HINTS = {
     "自然清新": "强调轻盈服饰、自然发型、道具与表情变化；保持背景与机位稳定，但人物身份与面部需重建为目标人群",
     "科幻未来": "强调材质与光泽、发色与装置配饰变化；保持背景与机位稳定，但人物身份与面部需重建为目标人群",
 }
+
+SEASONAL_TREND_HINTS = {
+    "spring": "current-season trend: lightweight layering, soft pastel or earthy accents, breathable textures",
+    "summer": "current-season trend: breathable fabrics, clean silhouettes, bright but controlled color accents",
+    "autumn": "current-season trend: layered outfits, knit textures, warm neutral palette with structured outerwear",
+    "winter": "current-season trend: thermal layering, wool/down outerwear, rich tones with textured accessories",
+}
+
+
+def _current_season() -> str:
+    month = datetime.now().month
+    if month in (3, 4, 5):
+        return "spring"
+    if month in (6, 7, 8):
+        return "summer"
+    if month in (9, 10, 11):
+        return "autumn"
+    return "winter"
+
+
+def _crowd_fashion_hint(crowd_type_id: str) -> str:
+    if crowd_type_id in {"C01", "C05"}:
+        return "age styling: child-safe details, playful styling, comfortable movement-friendly outfit"
+    if crowd_type_id in {"C02", "C06", "C08", "C09", "C10", "C11"}:
+        return "age styling: youth trend fit, social-media-ready styling, clean silhouette and accessories"
+    if crowd_type_id in {"C03", "C07", "C12", "C13", "C14", "C15", "C16", "C17", "C18", "C19"}:
+        return "age styling: mature elegant tailoring, premium texture, balanced accessories"
+    if crowd_type_id == "C04":
+        return "age styling: graceful senior elegance, comfortable premium fabrics, refined classic details"
+    return "age styling: fit clothing style to the target crowd age and identity"
 
 # 人群类型详细描述（用于提示词生成）
 CROWD_DESCRIPTIONS = {
@@ -73,6 +104,7 @@ class PromptGenerator:
         return """你是一个专业的AI绘画提示词生成专家。
 你需要根据用户提供的人群类型和风格，生成高质量的图像生成提示词。
 你必须以“参考底图”的背景为基础：保持背景场景、构图、机位、透视和光线稳定，但不要继承底图人物身份与五官，需要按目标人群重建人物脸和身份。
+你生成的是“同一景点打卡图的多人物版本”：地点、光影、景色要稳定，变化集中在人物类型与穿搭。
 
 提示词要求：
 1. 使用英文
@@ -97,23 +129,33 @@ class PromptGenerator:
     ) -> str:
         crowd_name = CROWD_TYPES.get(crowd_type_id, "未知")
         crowd_desc = CROWD_DESCRIPTIONS.get(crowd_type_id, "")
+        season = _current_season()
+        seasonal_hint = SEASONAL_TREND_HINTS.get(season, "")
+        crowd_fashion = _crowd_fashion_hint(crowd_type_id)
         ref_block = f"\n参考底图特征：{reference_context}" if reference_context else ""
         variation_block = (
             f"\n造型变化方向：{style_variation_hint}"
             if style_variation_hint
             else "\n造型变化方向：保持背景场景与机位稳定，人物身份与面部重建为目标人群，优先变化服装/发型/配饰/妆容，避免重复造型"
         )
+        trend_block = (
+            f"\n当季穿搭趋势：{seasonal_hint}"
+            if seasonal_hint
+            else ""
+        )
+        crowd_fashion_block = f"\n年龄段穿搭约束：{crowd_fashion}"
         return f"""请为以下组合生成一个图像生成提示词：
 
 人群类型：{crowd_name}（{crowd_desc}）
 风格：{style['name']}（{style['desc']}）
-{ref_block}{variation_block}
+{ref_block}{variation_block}{trend_block}{crowd_fashion_block}
 
 要求：
 - 输出英文正向提示词 + 负向提示词
 - 正向提示词和负向提示词用 "---NEGATIVE---" 分隔
 - 适合生成9:16比例的人物写真
-- 明确要求“仅参考底图背景（场景/机位/光线），不要继承底图人物脸和身份，按目标人群重建人物”"""
+- 明确要求“仅参考底图背景（景点/光影/景色），不要继承底图人物脸和身份，按目标人群重建人物”
+- 明确要求“背景建筑与地标关系保持稳定，不要改换成其他景点”"""
 
     async def generate_single(
         self,

@@ -13,8 +13,10 @@ import logging
 
 try:
     import cv2
+    import numpy as np
 except ImportError:  # pragma: no cover
     cv2 = None
+    np = None
 
 from app.core.database import get_db, SessionLocal
 from app.core.config import settings
@@ -34,7 +36,7 @@ def _summarize_reference_image(image_path: str) -> str:
     """
     提取参考底图的基础视觉特征，给提示词生成提供上下文。
     """
-    if not image_path or not cv2:
+    if not image_path or not cv2 or np is None:
         return ""
     try:
         image = cv2.imread(image_path)
@@ -62,6 +64,14 @@ def _summarize_reference_image(image_path: str) -> str:
         else:
             tone = "neutral color tone"
 
+        # 粗略判断昼夜与景点氛围
+        if brightness < 120 and color_delta > 10:
+            day_night = "night scene with warm architectural lighting"
+        elif brightness < 125:
+            day_night = "low-light evening scene"
+        else:
+            day_night = "daylight or well-lit outdoor scene"
+
         # 用边缘密度估计背景复杂度
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 100, 200)
@@ -73,8 +83,15 @@ def _summarize_reference_image(image_path: str) -> str:
         else:
             background = "clean minimal background"
 
+        # 用水平/垂直线段比例粗分建筑地标特征
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60, minLineLength=max(30, w // 12), maxLineGap=12)
+        if lines is not None and len(lines) >= 12:
+            architecture = "strong architectural landmark lines"
+        else:
+            architecture = "soft natural or mixed landmark background"
+
         orientation = "portrait orientation" if h >= w else "landscape orientation"
-        return f"{orientation}, {light}, {tone}, {background}"
+        return f"{orientation}, {day_night}, {light}, {tone}, {background}, {architecture}"
     except Exception as e:  # pragma: no cover
         logger.warning("解析参考底图特征失败: %s", e)
         return ""
@@ -87,18 +104,22 @@ def _build_task_prompt(base_prompt: str, style_name: str) -> str:
     base = (base_prompt or "").strip()
     guard = (
         "Use the reference image for background scene only. Keep location, camera angle, framing, perspective and "
-        "lighting consistent with the reference background. Replace the person identity and facial features with a "
+        "lighting consistent with the reference background. Keep the same landmark architecture and environment "
+        "composition across all style variants. Replace the person identity and facial features with a "
         f"new subject that matches the target crowd and style '{style_name}'. Do not preserve the original face. "
-        "Avoid changing background layout or scene structure."
+        "Avoid changing background layout, architecture, or scene structure."
     )
-    return f"{base}, {guard}" if base else guard
+    return f"{guard} {base}" if base else guard
 
 
 def _build_task_negative_prompt(base_negative: str) -> str:
     """
     强化负向约束：避免沿用底图原人物脸。
     """
-    extra = "same face as reference, same identity as reference person, lookalike clone face, identity preserved from reference"
+    extra = (
+        "same face as reference, same identity as reference person, lookalike clone face, "
+        "identity preserved from reference, background replaced, landmark changed, new location"
+    )
     base = (base_negative or "").strip()
     return f"{base}, {extra}" if base else extra
 

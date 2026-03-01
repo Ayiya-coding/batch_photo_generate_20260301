@@ -11,6 +11,14 @@ from datetime import datetime
 import asyncio
 import threading
 import logging
+from typing import Optional
+
+try:
+    import cv2
+    import numpy as np
+except ImportError:  # pragma: no cover
+    cv2 = None
+    np = None
 
 from app.core.database import get_db, SessionLocal
 from app.core.config import settings
@@ -24,6 +32,176 @@ router = APIRouter()
 
 TASK_TYPE = "wideface"
 TASK_KEY = "current"
+_FACE_CASCADE = None
+
+
+def _load_face_cascade():
+    global _FACE_CASCADE
+    if cv2 is None:
+        return None
+    if _FACE_CASCADE is not None:
+        return _FACE_CASCADE
+    try:
+        cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+        if not cascade_path.exists():
+            return None
+        detector = cv2.CascadeClassifier(str(cascade_path))
+        if detector.empty():
+            return None
+        _FACE_CASCADE = detector
+        return _FACE_CASCADE
+    except Exception:
+        return None
+
+
+def _detect_primary_face(image) -> Optional[tuple[int, int, int, int]]:
+    if cv2 is None:
+        return None
+    detector = _load_face_cascade()
+    if detector is None:
+        return None
+    try:
+        h, w = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        min_edge = max(24, min(h, w) // 14)
+        faces = detector.detectMultiScale(
+            gray,
+            scaleFactor=1.08,
+            minNeighbors=4,
+            minSize=(min_edge, min_edge),
+        )
+        if len(faces) == 0:
+            return None
+        x, y, fw, fh = max(faces, key=lambda item: item[2] * item[3])
+        return int(x), int(y), int(fw), int(fh)
+    except Exception:
+        return None
+
+
+def _fallback_face_rect(image_shape: tuple[int, int]) -> tuple[int, int, int, int]:
+    h, w = image_shape
+    fw = int(w * 0.34)
+    fh = int(h * 0.28)
+    x = int((w - fw) * 0.5)
+    y = int(h * 0.18)
+    return x, y, fw, fh
+
+
+def _warp_face_wider(
+    image: "np.ndarray",
+    face_rect: tuple[int, int, int, int],
+    strength: float = 0.30,
+) -> "np.ndarray":
+    if cv2 is None or np is None:
+        return image
+
+    h, w = image.shape[:2]
+    x, y, fw, fh = face_rect
+    pad_w = int(fw * 0.85)
+    pad_h = int(fh * 0.9)
+    x0 = max(0, x - pad_w)
+    x1 = min(w, x + fw + pad_w)
+    y0 = max(0, y - pad_h)
+    y1 = min(h, y + fh + pad_h)
+    if x1 - x0 < 20 or y1 - y0 < 20:
+        return image
+
+    roi = image[y0:y1, x0:x1].copy()
+    rh, rw = roi.shape[:2]
+    gx, gy = np.meshgrid(np.arange(rw, dtype=np.float32), np.arange(rh, dtype=np.float32))
+
+    # 在 ROI 中使用原 face 的中心作为拉伸中心
+    cx = float((x + fw / 2) - x0)
+    cy = float((y + fh * 0.52) - y0)
+    nx = (gx - cx) / max(8.0, fw * 0.75)
+    ny = (gy - cy) / max(8.0, fh * 0.95)
+    r2 = nx * nx + ny * ny
+    influence = np.exp(-r2 * 2.2)
+    scale = 1.0 + strength * influence
+    map_x = cx + (gx - cx) / scale
+    map_y = gy
+
+    warped = cv2.remap(
+        roi,
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT_101,
+    )
+
+    # 用椭圆软蒙版混合，避免硬边
+    mask = np.zeros((rh, rw), dtype=np.float32)
+    axes = (max(18, int((x1 - x0) * 0.38)), max(14, int((y1 - y0) * 0.36)))
+    cv2.ellipse(mask, (int(cx), int(cy)), axes, 0, 0, 360, 1.0, -1)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=9, sigmaY=9)
+    mask3 = mask[..., None]
+
+    blended = (roi.astype(np.float32) * (1.0 - mask3) + warped.astype(np.float32) * mask3).astype(np.uint8)
+    result = image.copy()
+    result[y0:y1, x0:x1] = blended
+    return result
+
+
+def _enforce_wideface_effect(
+    original_path: str,
+    generated_path: str,
+    min_ratio: float = 1.08,
+    target_ratio: float = 1.18,
+) -> tuple[bool, str]:
+    """
+    宽脸兜底：若 AI 结果面宽提升不足，则做一次局部几何增强，确保“看得出变宽”。
+    """
+    if cv2 is None or np is None:
+        return False, "opencv-not-available"
+    if not generated_path:
+        return False, "generated-path-empty"
+
+    gen_img = cv2.imread(generated_path)
+    if gen_img is None:
+        return False, "generated-read-failed"
+
+    src_face = None
+    if original_path:
+        src_img = cv2.imread(original_path)
+        if src_img is not None:
+            src_face = _detect_primary_face(src_img)
+    gen_face = _detect_primary_face(gen_img)
+
+    base_w = float(src_face[2]) if src_face else 0.0
+    gen_w = float(gen_face[2]) if gen_face else 0.0
+    ratio = (gen_w / base_w) if (base_w > 1 and gen_w > 1) else 0.0
+    if ratio >= min_ratio:
+        return True, f"ratio={ratio:.3f}"
+
+    face_rect = gen_face
+    if face_rect is None and src_face is not None:
+        sh, sw = src_img.shape[:2]
+        gh, gw = gen_img.shape[:2]
+        sx, sy, sww, shh = src_face
+        face_rect = (
+            int(sx * gw / max(1, sw)),
+            int(sy * gh / max(1, sh)),
+            int(sww * gw / max(1, sw)),
+            int(shh * gh / max(1, sh)),
+        )
+    if face_rect is None:
+        face_rect = _fallback_face_rect((gen_img.shape[0], gen_img.shape[1]))
+
+    # 根据当前比例自动给力度；无法估算比例时用中等力度
+    strength = 0.30
+    if ratio > 0:
+        strength = min(0.52, max(0.26, 0.24 + (target_ratio - ratio) * 0.95))
+
+    enhanced = _warp_face_wider(gen_img, face_rect, strength=strength)
+    enhanced_face = _detect_primary_face(enhanced)
+    if enhanced_face and src_face:
+        enhanced_ratio = enhanced_face[2] / max(1.0, src_face[2])
+        # 若第一轮不足，补一轮轻量增强
+        if enhanced_ratio < min_ratio:
+            enhanced = _warp_face_wider(enhanced, enhanced_face, strength=min(0.56, strength + 0.08))
+
+    ok = cv2.imwrite(generated_path, enhanced, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    return (ok, "post-warp-applied" if ok else "save-failed")
 
 
 def _normalize_watermark_engine(engine_name: str) -> str:
@@ -46,8 +224,8 @@ def _build_wideface_prompt(base_prompt: str) -> str:
     base = (base_prompt or "").strip()
     enforced = (
         "Edit the reference portrait only. Keep the same person identity, hairstyle, outfit, lighting and "
-        "background. Increase face width and jaw width by about 18-25%, keep face height almost unchanged, "
-        "maintain realistic skin texture, no caricature, no body reshaping."
+        "background. Increase face width and jaw width by about 22-32%, keep face height almost unchanged, "
+        "make cheeks visibly fuller, maintain realistic skin texture, no caricature, no body reshaping."
     )
     if not base:
         return enforced
@@ -150,7 +328,8 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
 
                     prompt = _build_wideface_prompt(wideface_prompt)
                     negative_prompt = (
-                        "slim face, narrow jaw, thin cheeks, tiny face, deformed anatomy, big head, "
+                        "slim face, narrow jaw, thin cheeks, tiny face, unchanged face width, no widening effect, "
+                        "deformed anatomy, big head, "
                         "cartoon, blurry, low quality, text, watermark"
                     )
 
@@ -159,11 +338,19 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
                         prompt=prompt,
                         negative_prompt=negative_prompt,
                         reference_image_path=tmpl.original_path,
-                        reference_weight=95,
+                        reference_weight=85,
                         output_path=out_path,
                     )
 
                     if success:
+                        enforced_ok, enforced_msg = _enforce_wideface_effect(
+                            original_path=tmpl.original_path,
+                            generated_path=out_path,
+                            min_ratio=1.08,
+                            target_ratio=1.18,
+                        )
+                        if not enforced_ok:
+                            logger.warning("宽脸后处理未生效: %s | %s", tmpl.id, enforced_msg)
                         tmpl.wide_face_path = out_path
                         tmpl.wide_face_status = "completed"
                         completed += 1

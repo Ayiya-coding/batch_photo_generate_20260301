@@ -13,6 +13,14 @@ from datetime import datetime
 import asyncio
 import threading
 import logging
+from typing import Optional
+
+try:
+    import cv2
+    import numpy as np
+except ImportError:  # pragma: no cover
+    cv2 = None
+    np = None
 
 from app.core.database import get_db, SessionLocal
 from app.core.config import settings
@@ -26,6 +34,139 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 TASK_TYPE = "generate"
+BG_REF_DIR = settings.PROCESSED_DIR / "background_refs"
+BG_REF_DIR.mkdir(parents=True, exist_ok=True)
+
+_FACE_CASCADE = None
+
+
+def _load_face_cascade():
+    global _FACE_CASCADE
+    if cv2 is None:
+        return None
+    if _FACE_CASCADE is not None:
+        return _FACE_CASCADE
+    try:
+        cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+        if not cascade_path.exists():
+            return None
+        detector = cv2.CascadeClassifier(str(cascade_path))
+        if detector.empty():
+            return None
+        _FACE_CASCADE = detector
+        return _FACE_CASCADE
+    except Exception:
+        return None
+
+
+def _detect_primary_face(image) -> Optional[tuple[int, int, int, int]]:
+    if cv2 is None:
+        return None
+    detector = _load_face_cascade()
+    if detector is None:
+        return None
+    try:
+        h, w = image.shape[:2]
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        min_edge = max(24, min(h, w) // 14)
+        faces = detector.detectMultiScale(
+            gray,
+            scaleFactor=1.08,
+            minNeighbors=4,
+            minSize=(min_edge, min_edge),
+        )
+        if len(faces) == 0:
+            return None
+        x, y, fw, fh = max(faces, key=lambda item: item[2] * item[3])
+        return int(x), int(y), int(fw), int(fh)
+    except Exception:
+        return None
+
+
+def _build_subject_mask(image) -> Optional["np.ndarray"]:
+    if cv2 is None or np is None:
+        return None
+    h, w = image.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    face = _detect_primary_face(image)
+    if face:
+        x, y, fw, fh = face
+        cx = x + fw // 2
+        top = max(0, y - int(fh * 0.9))
+        bottom = min(h, y + int(fh * 5.8))
+        half_w = int(fw * 1.9)
+        left = max(0, cx - half_w)
+        right = min(w, cx + half_w)
+    else:
+        # 无法稳定检测人脸时，按人像图常见主体区间兜底
+        top = int(h * 0.18)
+        bottom = h
+        left = int(w * 0.18)
+        right = int(w * 0.82)
+    cv2.rectangle(mask, (left, top), (right, bottom), 255, -1)
+    # 头肩区域做额外覆盖，防止原脸残留
+    head_cx = (left + right) // 2
+    head_cy = top + int((bottom - top) * 0.22)
+    cv2.ellipse(
+        mask,
+        (head_cx, head_cy),
+        (max(24, (right - left) // 3), max(20, (bottom - top) // 5)),
+        0,
+        0,
+        360,
+        255,
+        -1,
+    )
+    kernel = np.ones((25, 25), np.uint8)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    return mask
+
+
+def _render_background_reference(source_path: str, image_id: str) -> str:
+    """
+    生成“背景参考图”：弱化/抹除主体人像，保留景点、光影、构图，用于后续生图参考。
+    """
+    if not source_path:
+        return source_path
+    src = Path(source_path)
+    if not src.exists():
+        return source_path
+    if cv2 is None or np is None:
+        return source_path
+
+    out_path = BG_REF_DIR / f"{image_id}_bgref.jpg"
+    try:
+        if out_path.exists() and out_path.stat().st_mtime >= src.stat().st_mtime:
+            return str(out_path)
+    except Exception:
+        pass
+
+    image = cv2.imread(str(src))
+    if image is None:
+        return source_path
+
+    mask = _build_subject_mask(image)
+    if mask is None:
+        return source_path
+
+    try:
+        mask_ratio = float((mask > 0).mean())
+        # 面积过大时优先模糊，避免大面积 inpaint 伪影；面积适中时 inpaint + 模糊混合
+        blurred = cv2.GaussianBlur(image, (61, 61), 0)
+        if mask_ratio <= 0.35:
+            inpainted = cv2.inpaint(image, mask, 7, cv2.INPAINT_TELEA)
+            mixed = cv2.addWeighted(inpainted, 0.72, blurred, 0.28, 0)
+        else:
+            mixed = blurred
+
+        result = image.copy()
+        result[mask > 0] = mixed[mask > 0]
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out_path), result, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        return str(out_path)
+    except Exception as e:
+        logger.warning("生成背景参考图失败，回退原图: %s", e)
+        return source_path
 
 
 def _normalize_watermark_engine(engine_name: str) -> str:
@@ -93,21 +234,42 @@ async def _async_batch_generate(batch_id: str, engine: str):
                 img = db.query(BaseImage).filter(BaseImage.id == t.base_image_id).first()
                 image_task_map[t.base_image_id] = {
                     "filename": img.filename if img else "unknown",
+                    "ref_path": (img.processed_path or img.original_path) if img else "",
                     "total": 0, "completed": 0, "failed": 0,
                 }
             image_task_map[t.base_image_id]["total"] += 1
 
         per_image = {
-            img_id: {**info, "progress": 0}
+            img_id: {
+                "filename": info.get("filename", "unknown"),
+                "total": info.get("total", 0),
+                "completed": info.get("completed", 0),
+                "failed": info.get("failed", 0),
+                "progress": 0,
+            }
             for img_id, info in image_task_map.items()
         }
         reason_stats: dict[str, int] = {}
         quota_alerted = False
 
+        # 为每张底图预生成“背景参考图”，弱化人像，锁定景点/光影/构图
+        bg_reference_map: dict[str, str] = {}
+        for img_id, info in image_task_map.items():
+            src_ref = (info.get("ref_path") or "").strip()
+            if src_ref:
+                bg_reference_map[img_id] = _render_background_reference(src_ref, img_id)
+            else:
+                bg_reference_map[img_id] = src_ref
+
         ps.init(TASK_TYPE, batch_id, total,
                 f"开始批量生图: {total} 个任务, 引擎={engine}",
                 per_image=per_image,
                 reason_stats=reason_stats)
+        ps.append_log(
+            TASK_TYPE,
+            batch_id,
+            f"[REF] 已准备背景参考图 {len(bg_reference_map)} 张（锁景点/光影，弱化原人像）",
+        )
 
         generator = ConcurrentImageGenerator(
             api_key=api_key,
@@ -161,6 +323,7 @@ async def _async_batch_generate(batch_id: str, engine: str):
                         return
 
                     ref_path = img.processed_path or img.original_path
+                    ref_bg_path = bg_reference_map.get(img_id) or ref_path
                     output_filename = f"{task_id}_{t.crowd_type}_{t.style_name}.jpg"
                     output_path = str(settings.GENERATED_DIR / output_filename)
 
@@ -170,8 +333,8 @@ async def _async_batch_generate(batch_id: str, engine: str):
                         engine=task_engine,
                         prompt=t.prompt or "",
                         negative_prompt=t.negative_prompt or "",
-                        reference_image_path=ref_path,
-                        reference_weight=80,
+                        reference_image_path=ref_bg_path,
+                        reference_weight=92,
                         output_path=output_path,
                     )
 
