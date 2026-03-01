@@ -51,46 +51,46 @@ def _summarize_reference_image(image_path: str) -> str:
         color_delta = r_mean - b_mean
 
         if brightness >= 185:
-            light = "high-key bright lighting"
+            light = "高调明亮光线"
         elif brightness >= 130:
-            light = "balanced natural lighting"
+            light = "自然均衡光线"
         else:
-            light = "low-key dim lighting"
+            light = "低照度偏暗光线"
 
         if color_delta >= 18:
-            tone = "warm color tone"
+            tone = "偏暖色调"
         elif color_delta <= -18:
-            tone = "cool color tone"
+            tone = "偏冷色调"
         else:
-            tone = "neutral color tone"
+            tone = "中性色调"
 
         # 粗略判断昼夜与景点氛围
         if brightness < 120 and color_delta > 10:
-            day_night = "night scene with warm architectural lighting"
+            day_night = "夜景地标暖光氛围"
         elif brightness < 125:
-            day_night = "low-light evening scene"
+            day_night = "傍晚低照度氛围"
         else:
-            day_night = "daylight or well-lit outdoor scene"
+            day_night = "白天或高照明户外氛围"
 
         # 用边缘密度估计背景复杂度
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 100, 200)
         edge_density = float((edges > 0).mean())
         if edge_density >= 0.12:
-            background = "complex textured background"
+            background = "背景细节丰富"
         elif edge_density >= 0.06:
-            background = "moderate background details"
+            background = "背景细节中等"
         else:
-            background = "clean minimal background"
+            background = "背景较简洁"
 
         # 用水平/垂直线段比例粗分建筑地标特征
         lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60, minLineLength=max(30, w // 12), maxLineGap=12)
         if lines is not None and len(lines) >= 12:
-            architecture = "strong architectural landmark lines"
+            architecture = "建筑地标线条明显"
         else:
-            architecture = "soft natural or mixed landmark background"
+            architecture = "自然或混合场景地标"
 
-        orientation = "portrait orientation" if h >= w else "landscape orientation"
+        orientation = "竖图构图" if h >= w else "横图构图"
         return f"{orientation}, {day_night}, {light}, {tone}, {background}, {architecture}"
     except Exception as e:  # pragma: no cover
         logger.warning("解析参考底图特征失败: %s", e)
@@ -103,13 +103,11 @@ def _build_task_prompt(base_prompt: str, style_name: str) -> str:
     """
     base = (base_prompt or "").strip()
     guard = (
-        "Use the reference image for background scene only. Keep location, camera angle, framing, perspective and "
-        "lighting consistent with the reference background. Keep the same landmark architecture and environment "
-        "composition across all style variants. Replace the person identity and facial features with a "
-        f"new subject that matches the target crowd and style '{style_name}'. Do not preserve the original face. "
-        "Avoid changing background layout, architecture, or scene structure. Prioritize outfit, hair styling, "
-        "accessories and pose over facial micro-details. Keep the face clearly visible and unobstructed for later "
-        "face swap (no mask, no sunglasses, no heavy hand-on-face occlusion)."
+        f"仅参考底图背景（景点、建筑、光影、机位与构图）生成，保持背景与地标关系稳定。"
+        f"人物按“{style_name}”穿搭重建，不沿用原图人脸身份。"
+        "优先强调服装、发型、配饰、姿态，不要过度强调脸部微细节。"
+        "脸部需清晰无遮挡，禁止口罩、墨镜、手挡脸、头发遮眼。"
+        "禁止更换背景地点、禁止改换地标建筑。"
     )
     return f"{guard} {base}" if base else guard
 
@@ -119,9 +117,7 @@ def _build_task_negative_prompt(base_negative: str) -> str:
     强化负向约束：避免沿用底图原人物脸。
     """
     extra = (
-        "same face as reference, same identity as reference person, lookalike clone face, "
-        "identity preserved from reference, background replaced, landmark changed, new location, "
-        "face occluded, sunglasses, face mask, heavy bangs covering eyes, hand covering face, extreme face closeup"
+        "沿用原图人脸, 同一身份, 背景替换, 地标变更, 更换地点, 脸部遮挡, 墨镜, 口罩, 手挡脸, 头发遮眼, 过近脸部特写"
     )
     base = (base_negative or "").strip()
     return f"{base}, {extra}" if base else extra
@@ -146,8 +142,7 @@ async def _async_generate_prompts(
     try:
         from app.services.prompt_generator import (
             PromptGenerator,
-            DEFAULT_STYLES,
-            STYLE_VARIATION_HINTS,
+            get_styles_for_crowd,
         )
 
         api_key = get_setting_value(db, "prompt_api_key", "")
@@ -167,7 +162,10 @@ async def _async_generate_prompts(
             ps.fail(TASK_TYPE, batch_id, "没有已完成预处理的底图")
             return
 
-        styles = DEFAULT_STYLES
+        styles_by_crowd = {
+            ct_id: get_styles_for_crowd(ct_id)
+            for ct_id in crowd_type_ids
+        }
 
         ref_image = None
         if reference_image_id:
@@ -183,7 +181,7 @@ async def _async_generate_prompts(
 
         ref_path = ref_image.processed_path or ref_image.original_path
         reference_context = _summarize_reference_image(ref_path)
-        template_count = len(crowd_type_ids) * len(styles)
+        template_count = sum(len(v) for v in styles_by_crowd.values())
         task_count = len(base_images) * template_count
 
         ps.init(
@@ -191,7 +189,7 @@ async def _async_generate_prompts(
             batch_id,
             template_count,
             (
-                f"阶段1: 生成提示词模板 ({len(crowd_type_ids)} 类型 × {len(styles)} 风格 = {template_count} 条) "
+                f"阶段1: 生成提示词模板 ({len(crowd_type_ids)} 类型 × 每类5套穿搭 = {template_count} 条) "
                 f"| 参考底图: {ref_image.filename}"
             ),
         )
@@ -213,7 +211,8 @@ async def _async_generate_prompts(
                     f"提示词生成已中断：已完成 {completed_count}，失败 {failed_count}",
                 )
                 return
-            for style in styles:
+            ct_styles = styles_by_crowd.get(ct_id, [])
+            for style in ct_styles:
                 if ps.is_cancel_requested(TASK_TYPE, batch_id):
                     ps.cancel(
                         TASK_TYPE,
@@ -229,7 +228,7 @@ async def _async_generate_prompts(
                         ct_id,
                         style,
                         reference_context=reference_context,
-                        style_variation_hint=STYLE_VARIATION_HINTS.get(style["name"], ""),
+                        style_variation_hint=style.get("variation", ""),
                     )
 
                     existing = db.query(PromptTemplate).filter(
@@ -240,6 +239,7 @@ async def _async_generate_prompts(
                     if existing:
                         existing.positive_prompt = positive
                         existing.negative_prompt = negative
+                        existing.is_active = True
                     else:
                         db.add(PromptTemplate(
                             crowd_type=ct_id,
@@ -270,7 +270,31 @@ async def _async_generate_prompts(
         ps.append_log(TASK_TYPE, batch_id,
                       f"提示词模板完成，正在为 {len(base_images)} 张底图创建生成任务...")
 
-        # 保护：移除“当前选中人群之外”的待生成任务，避免误触发后继续跑95任务
+        allowed_style_names_by_crowd = {
+            ct_id: {s["name"] for s in styles_by_crowd.get(ct_id, [])}
+            for ct_id in crowd_type_ids
+        }
+
+        # 先失活当前人群下的旧风格模板，避免页面继续显示“古典东方/科幻未来”等画面风格
+        stale_templates = db.query(PromptTemplate).filter(
+            PromptTemplate.crowd_type.in_(crowd_type_ids),
+            PromptTemplate.is_active == True,
+        ).all()
+        deactivated = 0
+        for tmpl in stale_templates:
+            allowed_names = allowed_style_names_by_crowd.get(tmpl.crowd_type, set())
+            if tmpl.style_name not in allowed_names:
+                tmpl.is_active = False
+                deactivated += 1
+        if deactivated > 0:
+            db.commit()
+            ps.append_log(
+                TASK_TYPE,
+                batch_id,
+                f"[CLEANUP] 已失活旧风格提示词模板 {deactivated} 条",
+            )
+
+        # 保护：移除“当前选中人群之外”或“当前人群但旧风格”的遗留任务
         stale_task_ids = [
             row[0]
             for row in db.query(GenerateTask.id).join(BaseImage).filter(
@@ -279,6 +303,22 @@ async def _async_generate_prompts(
                 GenerateTask.status.in_(["pending", "failed", "processing"]),
             ).all()
         ]
+        for ct_id in crowd_type_ids:
+            allowed_names = list(allowed_style_names_by_crowd.get(ct_id, set()))
+            if not allowed_names:
+                continue
+            stale_task_ids.extend(
+                [
+                    row[0]
+                    for row in db.query(GenerateTask.id).join(BaseImage).filter(
+                        BaseImage.batch_id == batch_id,
+                        GenerateTask.crowd_type == ct_id,
+                        ~GenerateTask.style_name.in_(allowed_names),
+                        GenerateTask.status.in_(["pending", "failed", "processing"]),
+                    ).all()
+                ]
+            )
+        stale_task_ids = list(dict.fromkeys(stale_task_ids))
         if stale_task_ids:
             db.query(GenerateTask).filter(GenerateTask.id.in_(stale_task_ids)).delete(
                 synchronize_session=False
@@ -287,7 +327,7 @@ async def _async_generate_prompts(
             ps.append_log(
                 TASK_TYPE,
                 batch_id,
-                f"[CLEANUP] 已清理非当前人群的遗留任务 {len(stale_task_ids)} 条",
+                f"[CLEANUP] 已清理非当前配置的遗留任务 {len(stale_task_ids)} 条",
             )
 
         templates = db.query(PromptTemplate).filter(
@@ -309,7 +349,8 @@ async def _async_generate_prompts(
                 )
                 return
             for ct_id in crowd_type_ids:
-                for style in styles:
+                ct_styles = styles_by_crowd.get(ct_id, [])
+                for style in ct_styles:
                     existing_task = db.query(GenerateTask).filter(
                         GenerateTask.base_image_id == img.id,
                         GenerateTask.crowd_type == ct_id,

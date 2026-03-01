@@ -1,47 +1,181 @@
 """
 提示词生成服务 - 对接阿里百炼 API (通义千问, OpenAI 兼容格式)
 
-为每张底图 × 19种人群类型 × 5种风格 = 95 组提示词
+目标：
+- 以“人群年龄类型”为主轴
+- 为每类人群生成 5 套常见穿搭风格
+- 背景仅作为景点/光影参考，不作为风格类别
 """
-import httpx
-import json
 import asyncio
 import logging
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
+import httpx
 
 from app.core.config import settings
-from app.core.constants import CROWD_TYPES, STYLES_PER_TYPE
+from app.core.constants import CROWD_TYPES
 
 logger = logging.getLogger(__name__)
 
 # 阿里百炼 OpenAI 兼容端点
 BAILIAN_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 
-# 默认5种风格定义（只描述人物穿搭与气质，不改变背景地点）
-DEFAULT_STYLES = [
-    {"name": "古典东方", "desc": "新中式/汉服人物造型，强调衣料层次、发饰与仪态，不改背景场景"},
-    {"name": "古典西方", "desc": "复古欧式人物造型，强调礼服剪裁、珠宝配饰与气质，不改背景场景"},
-    {"name": "现代都市", "desc": "都市通勤与街拍穿搭，强调当季流行单品和妆发，不改背景场景"},
-    {"name": "自然清新", "desc": "轻户外与森系穿搭，强调舒适面料、轻妆和自然配色，不改背景场景"},
-    {"name": "科幻未来", "desc": "未来感潮流穿搭，强调材质光泽、配件与色彩点缀，不改背景场景"},
-]
-
-# 人物造型多样化方向（同风格内也要有造型变化）
-STYLE_VARIATION_HINTS = {
-    "古典东方": "强调汉服层次、发髻与发簪、袖型与腰封变化；保持背景与机位稳定，但人物身份与面部需重建为目标人群",
-    "古典西方": "强调宫廷礼服剪裁、发型卷度、珠宝与手套变化；保持背景与机位稳定，但人物身份与面部需重建为目标人群",
-    "现代都市": "强调日常穿搭、妆发细节、配饰与姿态微动作变化；保持背景与机位稳定，但人物身份与面部需重建为目标人群",
-    "自然清新": "强调轻盈服饰、自然发型、道具与表情变化；保持背景与机位稳定，但人物身份与面部需重建为目标人群",
-    "科幻未来": "强调材质与光泽、发色与装置配饰变化；保持背景与机位稳定，但人物身份与面部需重建为目标人群",
-}
-
 SEASONAL_TREND_HINTS = {
-    "spring": "current-season trend: lightweight layering, soft pastel or earthy accents, breathable textures",
-    "summer": "current-season trend: breathable fabrics, clean silhouettes, bright but controlled color accents",
-    "autumn": "current-season trend: layered outfits, knit textures, warm neutral palette with structured outerwear",
-    "winter": "current-season trend: thermal layering, wool/down outerwear, rich tones with textured accessories",
+    "spring": "春季：轻薄叠穿、柔和色彩、透气面料",
+    "summer": "夏季：清爽剪裁、轻量材质、亮色点缀",
+    "autumn": "秋季：层次叠穿、针织纹理、暖色中性色",
+    "winter": "冬季：保暖外套、羊毛羽绒、厚实质感",
 }
+
+# 每类人群 5 套穿搭模板（风格名是“服装风格”，不是“画面风格”）
+STYLE_PRESETS: Dict[str, List[Dict[str, str]]] = {
+    "C01": [
+        {"name": "童趣公主裙", "desc": "蓬裙/蝴蝶结/浅色系，突出童趣与可爱", "variation": "发饰与裙摆层次可变化，保持儿童友好"},
+        {"name": "新中式童装", "desc": "改良汉元素童装，强调盘扣、刺绣、轻盈披肩", "variation": "可切换马面裙/改良上衣组合"},
+        {"name": "校园运动童装", "desc": "运动卫衣/短裙或短裤，活力轻运动", "variation": "强调舒适鞋袜与轻运动道具"},
+        {"name": "中国红节日礼服", "desc": "中国红主色的节日礼服或套装，喜庆大气", "variation": "加入金色细节与传统纹样"},
+        {"name": "出游休闲童装", "desc": "针织开衫/连衣裙/休闲套装，适合景点打卡", "variation": "突出便携小包与舒适鞋履"},
+    ],
+    "C02": [
+        {"name": "新中式少女汉服", "desc": "轻汉服或新中式套装，注重衣料层次与发饰", "variation": "可变化对襟/立领/披帛等细节"},
+        {"name": "学院甜美洋装", "desc": "学院风连衣裙或套装，清新甜美", "variation": "领结、褶裙、针织开衫可替换"},
+        {"name": "都市轻通勤套装", "desc": "衬衫+半裙/西装外套+连衣裙，干净利落", "variation": "强调通勤包、简约配饰"},
+        {"name": "中国红庆典礼服", "desc": "中国红主色礼服/套装，适合夜景地标打卡", "variation": "可加入刺绣、金线、披肩"},
+        {"name": "潮流街头运动风", "desc": "机能外套/运动套装/潮流鞋履，年轻活力", "variation": "强调材质对比与层次叠穿"},
+    ],
+    "C03": [
+        {"name": "轻奢新中式套装", "desc": "改良旗袍/新中式两件套，端庄且有质感", "variation": "强调高级面料与精致配饰"},
+        {"name": "商务西装套装", "desc": "修身西装/阔腿裤或半裙，成熟职业感", "variation": "可变化驳领、腰线、配色"},
+        {"name": "优雅洋装礼裙", "desc": "中长款连衣裙或礼裙，强调女性线条与气质", "variation": "可变化裙型、袖型、腰饰"},
+        {"name": "中国红正式套装", "desc": "中国红为主的正式套装或礼服，稳重大气", "variation": "强调金色点缀和仪式感"},
+        {"name": "高级感休闲针织", "desc": "针织上衣+半裙/长裤，舒适但精致", "variation": "可加入围巾、耳饰、手袋"},
+    ],
+    "C04": [
+        {"name": "端庄中式套装", "desc": "中式上衣+长裙/长裤，沉稳典雅", "variation": "强调花纹克制、版型得体"},
+        {"name": "优雅针织外套", "desc": "针织开衫+内搭裙装，温和亲切", "variation": "可变化披肩、胸针、丝巾"},
+        {"name": "中国红喜庆礼装", "desc": "中国红节庆服饰，喜庆但不过度艳丽", "variation": "强调高级红色层次与质感"},
+        {"name": "舒适出游休闲装", "desc": "舒适套装、轻便鞋履，适合景点步行", "variation": "注重保暖与行动便利"},
+        {"name": "正式场合洋装", "desc": "简洁正式洋装或套装，体现庄重气质", "variation": "强调端正姿态与细节饰品"},
+    ],
+    "C05": [
+        {"name": "童趣绅士套装", "desc": "小西装/背带裤等童趣绅士穿搭", "variation": "可变化领结、帽饰、袜鞋搭配"},
+        {"name": "新中式童装男款", "desc": "中式立领童装，简洁有朝气", "variation": "可变化对襟、盘扣、袖口细节"},
+        {"name": "校园运动童装", "desc": "卫衣/运动套装，活泼好动", "variation": "强调机能面料和运动鞋"},
+        {"name": "中国红节日童装", "desc": "中国红节日套装，突出喜庆氛围", "variation": "加入传统图案但保持简洁"},
+        {"name": "户外机能童装", "desc": "轻户外夹克+工装裤，耐看实用", "variation": "可加入背包、护具等小道具"},
+    ],
+    "C06": [
+        {"name": "都市休闲少年装", "desc": "卫衣/夹克+休闲裤，阳光自然", "variation": "可变化层次叠穿与配色"},
+        {"name": "校园运动机能风", "desc": "运动上衣+短裤/长裤，轻机能", "variation": "强调动感姿态与鞋款"},
+        {"name": "青春西装套装", "desc": "年轻化西装穿搭，利落清爽", "variation": "可变化内搭T恤或衬衫"},
+        {"name": "新中式少年装", "desc": "立领外套/中式内搭，传统与现代融合", "variation": "强调线条干净、配饰克制"},
+        {"name": "中国红庆典套装", "desc": "中国红节庆套装，突出打卡仪式感", "variation": "可加入徽章、胸针等细节"},
+    ],
+    "C07": [
+        {"name": "商务西装套装", "desc": "成熟男士西装，稳重有型", "variation": "可变化领带、口袋巾、鞋款"},
+        {"name": "中式立领礼装", "desc": "中式立领外套或长衫，儒雅沉稳", "variation": "强调版型与面料纹理"},
+        {"name": "高级休闲夹克", "desc": "夹克/针织衫+休闲裤，成熟日常", "variation": "可变化材质与层次"},
+        {"name": "中国红庆典礼装", "desc": "中国红主色礼装，庄重且有节庆感", "variation": "强调红金搭配与细节克制"},
+        {"name": "户外旅行机能装", "desc": "轻机能外套+耐用裤装，适合景点行走", "variation": "强调实用配件与鞋履"},
+    ],
+}
+
+PAIR_STYLE_PRESETS: Dict[str, List[Dict[str, str]]] = {
+    "C08": [
+        {"name": "情侣新中式套装", "desc": "情侣同色系新中式穿搭，呼应但不过度统一", "variation": "强调配色与纹理呼应"},
+        {"name": "情侣都市通勤装", "desc": "情侣轻商务/通勤穿搭", "variation": "强调版型协调与鞋包搭配"},
+        {"name": "情侣中国红礼服", "desc": "节庆中国红情侣礼服", "variation": "突出仪式感和地标夜景匹配"},
+        {"name": "情侣休闲运动装", "desc": "舒适运动休闲情侣装", "variation": "强调活力互动姿态"},
+        {"name": "情侣正式西装洋装", "desc": "男西装+女洋装的正式搭配", "variation": "强调质感与礼仪感"},
+    ],
+    "C09": [
+        {"name": "闺蜜新中式双人装", "desc": "闺蜜新中式同主题穿搭", "variation": "配色呼应、款式有区分"},
+        {"name": "闺蜜都市轻通勤装", "desc": "闺蜜城市打卡通勤穿搭", "variation": "强调包袋与鞋款差异"},
+        {"name": "闺蜜中国红礼装", "desc": "中国红喜庆闺蜜礼装", "variation": "可变化裙型和配饰"},
+        {"name": "闺蜜甜美洋装", "desc": "甜美裙装组合，适合轻松打卡", "variation": "强调发饰和妆容清新"},
+        {"name": "闺蜜休闲运动装", "desc": "休闲运动双人装，轻松活力", "variation": "注重动态姿态"},
+    ],
+    "C10": [
+        {"name": "兄弟都市休闲装", "desc": "兄弟同色系休闲穿搭", "variation": "版型接近但细节区别"},
+        {"name": "兄弟运动机能装", "desc": "运动机能风双人装", "variation": "强调层次与功能配件"},
+        {"name": "兄弟商务西装", "desc": "双人西装风格，成熟稳重", "variation": "领带和配色可区分"},
+        {"name": "兄弟新中式装", "desc": "中式立领双人穿搭", "variation": "传统元素适度点缀"},
+        {"name": "兄弟中国红礼装", "desc": "中国红节庆兄弟装", "variation": "强调庆典感与庄重感"},
+    ],
+    "C11": [
+        {"name": "异性伙伴通勤装", "desc": "异性伙伴轻商务通勤搭配", "variation": "服装风格协调但不情侣化"},
+        {"name": "异性伙伴休闲装", "desc": "日常休闲搭配，友好自然", "variation": "强调舒适和自然互动"},
+        {"name": "异性伙伴新中式装", "desc": "新中式双人搭配", "variation": "纹理与配色相互呼应"},
+        {"name": "异性伙伴正式礼装", "desc": "西装+洋装正式双人装", "variation": "突出地标打卡仪式感"},
+        {"name": "异性伙伴中国红套装", "desc": "中国红节庆双人套装", "variation": "强调庄重与喜庆平衡"},
+    ],
+    "C12": [
+        {"name": "母子新中式亲子装", "desc": "母亲与少年儿子新中式亲子搭配", "variation": "亲子同主题不同版型"},
+        {"name": "母子都市亲子装", "desc": "通勤休闲亲子穿搭", "variation": "强调亲和与生活感"},
+        {"name": "母子中国红礼装", "desc": "中国红节庆亲子礼装", "variation": "注重仪式感和体面"},
+        {"name": "母子休闲运动装", "desc": "轻运动亲子搭配", "variation": "强调互动姿态"},
+        {"name": "母子正式场合装", "desc": "正式场景亲子搭配", "variation": "突出端庄与少年感平衡"},
+    ],
+    "C13": [
+        {"name": "母子新中式亲子装", "desc": "母亲与青年儿子新中式亲子搭配", "variation": "同主题不同成熟度"},
+        {"name": "母子都市通勤装", "desc": "都市通勤亲子搭配", "variation": "强调干练与亲和"},
+        {"name": "母子中国红礼装", "desc": "中国红节庆亲子礼装", "variation": "端庄稳重"},
+        {"name": "母子休闲出游装", "desc": "出游休闲亲子装", "variation": "舒适面料与自然互动"},
+        {"name": "母子正式礼装", "desc": "正式场合亲子套装", "variation": "强调仪式感"},
+    ],
+    "C14": [
+        {"name": "母女新中式亲子装", "desc": "母亲与少年女儿新中式搭配", "variation": "同色系层次变化"},
+        {"name": "母女甜美洋装", "desc": "母女甜美裙装搭配", "variation": "强调发饰与裙型呼应"},
+        {"name": "母女中国红礼装", "desc": "中国红节庆母女装", "variation": "喜庆但有高级感"},
+        {"name": "母女休闲出游装", "desc": "母女轻出游休闲装", "variation": "舒适与拍照友好"},
+        {"name": "母女正式礼装", "desc": "正式场景母女搭配", "variation": "强调优雅与亲密感"},
+    ],
+    "C15": [
+        {"name": "母女新中式亲子装", "desc": "母亲与青年女儿新中式搭配", "variation": "注重成熟感与年轻感平衡"},
+        {"name": "母女都市通勤装", "desc": "母女都市通勤搭配", "variation": "强调简洁线条"},
+        {"name": "母女中国红礼装", "desc": "中国红节庆母女礼装", "variation": "大气庄重"},
+        {"name": "母女休闲出游装", "desc": "母女出游休闲装", "variation": "舒适材质与配饰呼应"},
+        {"name": "母女正式礼装", "desc": "正式场景母女礼装", "variation": "强调气质与体面"},
+    ],
+    "C16": [
+        {"name": "父子新中式亲子装", "desc": "父亲与少年儿子新中式搭配", "variation": "同主题不同版型"},
+        {"name": "父子都市休闲装", "desc": "父子都市休闲搭配", "variation": "强调阳光与干练"},
+        {"name": "父子中国红礼装", "desc": "中国红节庆父子礼装", "variation": "稳重喜庆"},
+        {"name": "父子运动机能装", "desc": "父子运动机能搭配", "variation": "强调活力互动"},
+        {"name": "父子正式西装", "desc": "父子正式西装搭配", "variation": "强调仪式感"},
+    ],
+    "C17": [
+        {"name": "父子新中式亲子装", "desc": "父亲与青年儿子新中式搭配", "variation": "成熟稳重与青年感平衡"},
+        {"name": "父子商务通勤装", "desc": "父子商务通勤搭配", "variation": "强调线条利落"},
+        {"name": "父子中国红礼装", "desc": "中国红节庆父子礼装", "variation": "庄重体面"},
+        {"name": "父子休闲出游装", "desc": "父子出游休闲装", "variation": "舒适实用"},
+        {"name": "父子正式西装", "desc": "父子正式西装搭配", "variation": "强调礼仪感"},
+    ],
+    "C18": [
+        {"name": "父女新中式亲子装", "desc": "父亲与少年女儿新中式搭配", "variation": "亲子呼应与童趣平衡"},
+        {"name": "父女都市休闲装", "desc": "父女日常休闲搭配", "variation": "自然轻松互动"},
+        {"name": "父女中国红礼装", "desc": "中国红节庆父女礼装", "variation": "喜庆但不过度华丽"},
+        {"name": "父女甜美洋装", "desc": "父女正式+甜美组合搭配", "variation": "强调父女气质差异化"},
+        {"name": "父女正式礼装", "desc": "正式场景父女礼装", "variation": "强调守护感与仪式感"},
+    ],
+    "C19": [
+        {"name": "父女新中式亲子装", "desc": "父亲与青年女儿新中式搭配", "variation": "成熟感与青春感平衡"},
+        {"name": "父女都市通勤装", "desc": "父女都市通勤搭配", "variation": "强调高级简洁"},
+        {"name": "父女中国红礼装", "desc": "中国红节庆父女礼装", "variation": "突出庄重大气"},
+        {"name": "父女优雅洋装", "desc": "父女正式+优雅组合搭配", "variation": "强调服装质感与配饰"},
+        {"name": "父女正式礼装", "desc": "正式场景父女礼装", "variation": "突出体面与地标打卡感"},
+    ],
+}
+
+
+DEFAULT_STYLES = STYLE_PRESETS["C02"]
+
+
+def get_styles_for_crowd(crowd_type_id: str) -> List[Dict[str, str]]:
+    if crowd_type_id in STYLE_PRESETS:
+        return STYLE_PRESETS[crowd_type_id]
+    return PAIR_STYLE_PRESETS.get(crowd_type_id, DEFAULT_STYLES)
 
 
 def _current_season() -> str:
@@ -57,63 +191,63 @@ def _current_season() -> str:
 
 def _crowd_fashion_hint(crowd_type_id: str) -> str:
     if crowd_type_id in {"C01", "C05"}:
-        return "age styling: child-safe details, playful styling, comfortable movement-friendly outfit"
+        return "儿童向：童趣、安全、舒适，方便活动，避免成人化设计"
     if crowd_type_id in {"C02", "C06", "C08", "C09", "C10", "C11"}:
-        return "age styling: youth trend fit, social-media-ready styling, clean silhouette and accessories"
+        return "青年向：符合当季流行趋势，线条利落，配饰简洁，适合打卡出片"
     if crowd_type_id in {"C03", "C07", "C12", "C13", "C14", "C15", "C16", "C17", "C18", "C19"}:
-        return "age styling: mature elegant tailoring, premium texture, balanced accessories"
+        return "成熟向：强调剪裁与面料质感，配色克制，配饰平衡"
     if crowd_type_id == "C04":
-        return "age styling: graceful senior elegance, comfortable premium fabrics, refined classic details"
-    return "age styling: fit clothing style to the target crowd age and identity"
+        return "长者向：端庄优雅、舒适保暖、细节精致但不过度装饰"
+    return "根据人群年龄与身份匹配穿搭风格"
 
 
 def _recommended_outfit_pack(crowd_type_id: str, season: str) -> str:
     season_token = {
-        "spring": "spring",
-        "summer": "summer",
-        "autumn": "autumn",
-        "winter": "winter",
-    }.get(season, "current season")
+        "spring": "春季",
+        "summer": "夏季",
+        "autumn": "秋季",
+        "winter": "冬季",
+    }.get(season, "当季")
 
     if crowd_type_id in {"C01", "C05"}:
         packs = [
-            f"{season_token} playful casual set",
-            "mini new-Chinese kid hanfu set",
-            "storybook princess/prince costume set",
-            "street sport mini set",
-            "festival photo outfit set",
+            f"{season_token}童趣休闲套装",
+            "新中式童装",
+            "童话礼服/小绅士礼装",
+            "校园运动童装",
+            "节日打卡童装",
         ]
     elif crowd_type_id in {"C02", "C06"}:
         packs = [
-            f"{season_token} city casual look",
-            "smart business suit look",
-            "new-Chinese urban fusion look",
-            "retro formal look",
-            "outdoor travel check-in look",
+            f"{season_token}都市休闲穿搭",
+            "轻商务西装/洋装",
+            "新中式潮流穿搭",
+            "复古正式穿搭",
+            "户外旅行打卡穿搭",
         ]
     elif crowd_type_id in {"C03", "C07"}:
         packs = [
-            f"{season_token} premium minimal look",
-            "tailored business/formal look",
-            "new-Chinese elegant look",
-            "retro classic evening look",
-            "resort-travel refined look",
+            f"{season_token}高级感简约穿搭",
+            "商务正式西装套装",
+            "新中式优雅穿搭",
+            "复古经典礼装",
+            "旅行轻奢休闲装",
         ]
     elif crowd_type_id == "C04":
         packs = [
-            f"{season_token} graceful comfort look",
-            "classic cheongsam/han style look",
-            "refined knit + outerwear look",
-            "heritage elegant formal look",
-            "warm family-photo travel look",
+            f"{season_token}端庄舒适穿搭",
+            "经典中式礼装",
+            "优雅针织外套穿搭",
+            "正式场合礼装",
+            "家庭出游温暖穿搭",
         ]
     else:
         packs = [
-            f"{season_token} trend casual look",
-            "smart formal look",
-            "new-Chinese style look",
-            "retro look",
-            "travel check-in look",
+            f"{season_token}趋势休闲穿搭",
+            "商务正式穿搭",
+            "新中式穿搭",
+            "复古穿搭",
+            "旅行打卡穿搭",
         ]
     return ", ".join(packs)
 
@@ -158,13 +292,13 @@ class PromptGenerator:
 你生成的是“同一景点打卡图的多人物版本”：地点、光影、景色要稳定，变化集中在人物类型与穿搭。
 
 提示词要求：
-1. 使用英文
+1. 使用中文
 2. 包含人物描述（年龄、性别、气质、表情）
 3. 包含服装描述（风格、颜色、材质、细节）
 4. 包含场景描述（背景、环境、氛围）
 5. 包含光线和画面质量描述
 6. 适合生成9:16比例的高质量人物写真照片
-7. 每个提示词控制在80-150个英文单词
+7. 每个提示词控制在80-150个中文词
 
 输出格式要求：
 - 只输出提示词本身，不要加任何解释或标题
@@ -204,7 +338,7 @@ class PromptGenerator:
 {ref_block}{variation_block}{trend_block}{crowd_fashion_block}{outfit_pack_block}
 
 要求：
-- 输出英文正向提示词 + 负向提示词
+- 输出中文正向提示词 + 负向提示词
 - 正向提示词和负向提示词用 "---NEGATIVE---" 分隔
 - 适合生成9:16比例的人物写真
 - 明确要求“仅参考底图背景（景点/光影/景色），不要继承底图人物脸和身份，按目标人群重建人物”
@@ -260,14 +394,29 @@ class PromptGenerator:
             data = resp.json()
             content = data["choices"][0]["message"]["content"].strip()
 
-            # 解析正向/负向提示词
-            if "---NEGATIVE---" in content:
-                parts = content.split("---NEGATIVE---", 1)
-                positive = parts[0].strip()
-                negative = parts[1].strip()
-            else:
-                positive = content
-                negative = "low quality, blurry, distorted, deformed, ugly, bad anatomy, watermark, text"
+            # 解析正向/负向提示词（兼容中英文分隔）
+            separators = [
+                "---NEGATIVE---",
+                "---负向---",
+                "【负向提示词】",
+                "负向提示词：",
+                "负面提示词：",
+                "负向：",
+            ]
+            positive = content
+            negative = ""
+            for sep in separators:
+                if sep in content:
+                    parts = content.split(sep, 1)
+                    positive = parts[0].strip()
+                    negative = parts[1].strip()
+                    break
+
+            if not negative:
+                negative = (
+                    "低清晰度、模糊、畸形手、肢体异常、五官错位、背景错景、地标错位、"
+                    "保留原人脸、遮挡脸部、口罩、墨镜、水印、文字、噪点、过曝"
+                )
 
             return positive, negative
 
@@ -283,31 +432,32 @@ class PromptGenerator:
 
         Args:
             crowd_type_ids: 人群类型ID列表，None则全部19种
-            styles: 风格列表，None则使用默认5种
+            styles: 风格列表（仅在单一人群调试时传入），None则按人群自动选择5种穿搭
             progress_callback: 进度回调 (current, total, crowd_type, style_name, status)
 
         Returns:
-            [{"crowd_type": "C01", "style_name": "古典东方",
+            [{"crowd_type": "C01", "style_name": "童趣公主裙",
               "positive_prompt": "...", "negative_prompt": "..."}, ...]
         """
         if crowd_type_ids is None:
             crowd_type_ids = list(CROWD_TYPES.keys())
-        if styles is None:
-            styles = DEFAULT_STYLES
-
-        total = len(crowd_type_ids) * len(styles)
+        styles_by_crowd = {}
+        for ct_id in crowd_type_ids:
+            styles_by_crowd[ct_id] = styles if styles is not None else get_styles_for_crowd(ct_id)
+        total = sum(len(v) for v in styles_by_crowd.values())
         results = []
         current = 0
 
         for ct_id in crowd_type_ids:
-            for style in styles:
+            ct_styles = styles_by_crowd.get(ct_id, [])
+            for style in ct_styles:
                 current += 1
                 try:
                     positive, negative = await self.generate_single(
                         ct_id,
                         style,
                         reference_context=reference_context,
-                        style_variation_hint=STYLE_VARIATION_HINTS.get(style.get("name", ""), ""),
+                        style_variation_hint=style.get("variation", ""),
                     )
                     results.append({
                         "crowd_type": ct_id,
