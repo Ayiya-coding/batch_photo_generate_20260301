@@ -6,6 +6,8 @@ __pycache__/
 venv/
 env/
 .venv/
+backend/venv/
+backend/.venv/
 
 # IDE
 .vscode/
@@ -52,12 +54,14 @@ data/
 *.bat
 
 # 临时文件
-*.bak
+*.bak*
 *.bak2
 *.bak3
 *.fixed
 *.fixed2
 nul
+.tmp/
+.trae/
 
 # 备份和pencil文件
 *.pen.bak*

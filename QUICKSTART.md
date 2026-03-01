@@ -5,7 +5,7 @@ AI 图片批量生成系统（Windows / Mac 一键启动说明）
 1) 文件夹要求
 - 项目可放任意目录（桌面/D盘/下载目录均可）。
 - 必须保持目录结构不变，尤其是：
-  - `start_local.cmd` / `start_local.sh`
+  - `scripts/start_local.cmd` / `scripts/start_local.sh`
   - `可行性分析/AccessKey.txt`
   - `.env.example`
 
@@ -23,16 +23,16 @@ AI 图片批量生成系统（Windows / Mac 一键启动说明）
   - `VOLC_SECRET_ACCESS_KEY`
 
 4) Windows 一键启动/停止
-- 启动：双击 `start_local.cmd`
-- 停止：双击 `stop_local.cmd`
+- 启动：双击 `scripts/start_local.cmd`
+- 停止：双击 `scripts/stop_local.cmd`
 - 首次启动会自动安装依赖，耗时较长属正常
 - 启动后访问：
   - 前端: `http://localhost:3000`
   - 后端: `http://localhost:8000`
 
 5) Mac 一键启动/停止
-- 启动：`./start_local.sh`
-- 停止：`./stop_local.sh`
+- 启动：`./scripts/start_local.sh`
+- 停止：`./scripts/stop_local.sh`
 
 6) 推荐给 AI 的一句话（给不会配环境的人）
 - 可直接把下面这句发给 AI（如 ChatGPT/Codex）：

@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(ls:*)",
+      "Bash(dir:*)",
+      "Bash(echo:*)",
+      "Bash(wc:*)",
+      "Bash(where:*)",
+      "Bash(findstr:*)",
+      "Bash(curl:*)",
+      "Bash(ping:*)",
+      "Bash(netstat:*)",
+      "Bash(tasklist:*)",
+      "Bash(taskkill:*)",
+      "Bash(timeout:*)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(pip show:*)",
+      "Bash(pip uninstall:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(powershell -NoProfile -Command:*)",
+      "Bash(source:*)",
+      "Bash(wmic process where \"name=''python.exe''\" get ProcessId,CommandLine)"
+    ]
+  }
+}
