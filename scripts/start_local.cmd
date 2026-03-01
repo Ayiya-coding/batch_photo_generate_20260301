@@ -2,7 +2,8 @@
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 
-set "ROOT=%~dp0"
+REM Get project root (parent of scripts directory)
+set "ROOT=%~dp0.."
 cd /d "%ROOT%"
 
 set "RUNTIME_DIR=%ROOT%.runtime"

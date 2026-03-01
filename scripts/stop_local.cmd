@@ -2,8 +2,9 @@
 setlocal EnableExtensions
 chcp 65001 >nul
 
-set "ROOT=%~dp0"
-set "PID_DIR=%ROOT%.runtime\pids"
+REM Get project root (parent of scripts directory)
+set "ROOT=%~dp0.."
+set "PID_DIR=%ROOT%\.runtime\pids"
 
 echo ========================================
 echo   AI 图片批量生成系统 - Windows 停止脚本

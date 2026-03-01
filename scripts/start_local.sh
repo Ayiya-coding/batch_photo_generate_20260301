@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Get project root (parent of scripts directory)
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_DIR="$ROOT_DIR/.runtime"
 PID_DIR="$RUNTIME_DIR/pids"
 LOG_DIR="$RUNTIME_DIR/logs"
