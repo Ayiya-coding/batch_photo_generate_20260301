@@ -29,6 +29,7 @@ export const API = {
     list: `${API_BASE}/prompt/list`,
     edit: (id: string) => `${API_BASE}/prompt/edit/${id}`,
     delete: (id: string) => `${API_BASE}/prompt/delete/${id}`,
+    deleteByCrowd: (crowdType: string) => `${API_BASE}/prompt/delete-by-crowd/${crowdType}`,
   },
 
   // ===== 批量生图 =====

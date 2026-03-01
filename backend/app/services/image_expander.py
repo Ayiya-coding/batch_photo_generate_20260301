@@ -20,6 +20,90 @@ from app.core.config import settings as app_settings
 logger = logging.getLogger(__name__)
 
 
+def _compute_padding(
+    src_w: int,
+    src_h: int,
+    target_w: int,
+    target_h: int,
+    offset: float = 0.0,
+) -> tuple[int, int, int, int]:
+    """根据目标尺寸与偏移计算 padding(top, bottom, left, right)。"""
+    clamped = max(-1.0, min(1.0, float(offset)))
+    total_h = max(0, target_h - src_h)
+    total_w = max(0, target_w - src_w)
+
+    pad_top = int(round(total_h * (0.5 + clamped * 0.5)))
+    pad_top = max(0, min(total_h, pad_top))
+    pad_bottom = total_h - pad_top
+
+    pad_left = int(round(total_w * (0.5 + clamped * 0.5)))
+    pad_left = max(0, min(total_w, pad_left))
+    pad_right = total_w - pad_left
+    return pad_top, pad_bottom, pad_left, pad_right
+
+
+def _smooth_seam_band(image: np.ndarray, y0: int, y1: int, x0: int, x1: int):
+    """对拼接带做轻度平滑，减少撕裂条纹。"""
+    h, w = image.shape[:2]
+    ys = max(0, y0)
+    ye = min(h, y1)
+    xs = max(0, x0)
+    xe = min(w, x1)
+    if ys >= ye or xs >= xe:
+        return
+
+    band = image[ys:ye, xs:xe]
+    if band.size == 0:
+        return
+    image[ys:ye, xs:xe] = cv2.GaussianBlur(band, (0, 0), sigmaX=0.8, sigmaY=0.8)
+
+
+def _postprocess_outpaint_result(
+    result_image: np.ndarray,
+    source_image: np.ndarray,
+    target_width: int,
+    target_height: int,
+    offset: float = 0.0,
+) -> np.ndarray:
+    """
+    AI 扩图后处理：
+    1) 尺寸对齐
+    2) 回贴原图中心区域，避免主区域被撕裂
+    3) 拼接缝轻度平滑，降低上下条纹
+    """
+    if result_image is None:
+        return source_image
+
+    result_h, result_w = result_image.shape[:2]
+    if (result_w, result_h) != (target_width, target_height):
+        result_image = cv2.resize(result_image, (target_width, target_height), interpolation=cv2.INTER_CUBIC)
+
+    src_h, src_w = source_image.shape[:2]
+    pad_top, pad_bottom, pad_left, pad_right = _compute_padding(
+        src_w, src_h, target_width, target_height, offset=offset,
+    )
+
+    y0 = pad_top
+    y1 = min(target_height, y0 + src_h)
+    x0 = pad_left
+    x1 = min(target_width, x0 + src_w)
+
+    src_crop = source_image[: y1 - y0, : x1 - x0]
+    result_image[y0:y1, x0:x1] = src_crop
+
+    seam = max(2, min(10, min(src_h, src_w) // 50))
+    if pad_top > 0:
+        _smooth_seam_band(result_image, y0 - seam, y0 + seam, x0, x1)
+    if pad_bottom > 0:
+        _smooth_seam_band(result_image, y1 - seam, y1 + seam, x0, x1)
+    if pad_left > 0:
+        _smooth_seam_band(result_image, y0, y1, x0 - seam, x0 + seam)
+    if pad_right > 0:
+        _smooth_seam_band(result_image, y0, y1, x1 - seam, x1 + seam)
+
+    return result_image
+
+
 class APIYiOutpaintClient:
     """API易平台 outpainting 客户端 (SeedDream 4.5)"""
 
@@ -263,15 +347,29 @@ async def expand_to_target_ratio(
         logger.info(f"扩图: {w}x{h} -> {new_w}x{new_h} (目标比例 {target_w}:{target_h}, 引擎={engine})")
 
         result_image = None
+        result_source = "none"
 
         # 引擎选择
         if engine in ("auto", "iopaint"):
             result_image = await _try_iopaint(image, new_w, new_h, iopaint_url, offset=offset)
+            if result_image is not None:
+                result_source = "iopaint"
 
         if result_image is None and engine in ("auto", "seedream"):
             result_image = await _try_apiyi(image, new_w, new_h, apiyi_api_key)
+            if result_image is not None:
+                result_source = "seedream"
 
         if result_image is not None:
+            # Seedream 不支持 offset，避免错误位移，按居中进行回贴
+            repair_offset = offset if result_source == "iopaint" else 0.0
+            result_image = _postprocess_outpaint_result(
+                result_image=result_image,
+                source_image=image,
+                target_width=new_w,
+                target_height=new_h,
+                offset=repair_offset,
+            )
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(output_path, result_image)
             logger.info(f"扩图成功: {input_path} -> {output_path} ({new_w}x{new_h})")

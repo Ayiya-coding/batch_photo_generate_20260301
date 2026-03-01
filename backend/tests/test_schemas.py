@@ -126,6 +126,22 @@ class TestPromptGenerateRequest:
         req = PromptGenerateRequest(batch_id=VALID_UUID)
         assert req.crowd_types is None
 
+    def test_reference_image_id_valid(self):
+        req = PromptGenerateRequest(
+            batch_id=VALID_UUID,
+            crowd_types=["C01"],
+            reference_image_id=VALID_UUID,
+        )
+        assert req.reference_image_id == VALID_UUID
+
+    def test_reference_image_id_invalid(self):
+        with pytest.raises(ValidationError, match="reference_image_id 格式不合法"):
+            PromptGenerateRequest(
+                batch_id=VALID_UUID,
+                crowd_types=["C01"],
+                reference_image_id="bad-id",
+            )
+
 
 # ── GenerateRequest ────────────────────────────────────────────
 

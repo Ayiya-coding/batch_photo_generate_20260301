@@ -11,6 +11,11 @@ import asyncio
 import threading
 import logging
 
+try:
+    import cv2
+except ImportError:  # pragma: no cover
+    cv2 = None
+
 from app.core.database import get_db, SessionLocal
 from app.core.config import settings
 from app.core.settings_resolver import get_setting_value
@@ -25,20 +30,101 @@ router = APIRouter()
 TASK_TYPE = "prompt"
 
 
-def _run_prompt_gen_background(batch_id: str, crowd_type_ids: list):
+def _summarize_reference_image(image_path: str) -> str:
+    """
+    提取参考底图的基础视觉特征，给提示词生成提供上下文。
+    """
+    if not image_path or not cv2:
+        return ""
+    try:
+        image = cv2.imread(image_path)
+        if image is None:
+            return ""
+
+        h, w = image.shape[:2]
+        b_mean = float(image[:, :, 0].mean())
+        g_mean = float(image[:, :, 1].mean())
+        r_mean = float(image[:, :, 2].mean())
+        brightness = (r_mean + g_mean + b_mean) / 3.0
+        color_delta = r_mean - b_mean
+
+        if brightness >= 185:
+            light = "high-key bright lighting"
+        elif brightness >= 130:
+            light = "balanced natural lighting"
+        else:
+            light = "low-key dim lighting"
+
+        if color_delta >= 18:
+            tone = "warm color tone"
+        elif color_delta <= -18:
+            tone = "cool color tone"
+        else:
+            tone = "neutral color tone"
+
+        # 用边缘密度估计背景复杂度
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 100, 200)
+        edge_density = float((edges > 0).mean())
+        if edge_density >= 0.12:
+            background = "complex textured background"
+        elif edge_density >= 0.06:
+            background = "moderate background details"
+        else:
+            background = "clean minimal background"
+
+        orientation = "portrait orientation" if h >= w else "landscape orientation"
+        return f"{orientation}, {light}, {tone}, {background}"
+    except Exception as e:  # pragma: no cover
+        logger.warning("解析参考底图特征失败: %s", e)
+        return ""
+
+
+def _build_task_prompt(base_prompt: str, style_name: str) -> str:
+    """
+    在模板提示词上追加“参考背景、替换人物”的硬约束，降低跑偏。
+    """
+    base = (base_prompt or "").strip()
+    guard = (
+        "Use the reference image for background scene only. Keep location, camera angle, framing, perspective and "
+        "lighting consistent with the reference background. Replace the person identity and facial features with a "
+        f"new subject that matches the target crowd and style '{style_name}'. Do not preserve the original face. "
+        "Avoid changing background layout or scene structure."
+    )
+    return f"{base}, {guard}" if base else guard
+
+
+def _build_task_negative_prompt(base_negative: str) -> str:
+    """
+    强化负向约束：避免沿用底图原人物脸。
+    """
+    extra = "same face as reference, same identity as reference person, lookalike clone face, identity preserved from reference"
+    base = (base_negative or "").strip()
+    return f"{base}, {extra}" if base else extra
+
+
+def _run_prompt_gen_background(batch_id: str, crowd_type_ids: list, reference_image_id: str | None = None):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_async_generate_prompts(batch_id, crowd_type_ids))
+        loop.run_until_complete(_async_generate_prompts(batch_id, crowd_type_ids, reference_image_id))
     finally:
         loop.close()
 
 
-async def _async_generate_prompts(batch_id: str, crowd_type_ids: list):
+async def _async_generate_prompts(
+    batch_id: str,
+    crowd_type_ids: list,
+    reference_image_id: str | None = None,
+):
     """异步批量生成提示词 — 分两阶段：1) 调API生成模板 2) 为所有底图创建任务"""
     db = SessionLocal()
     try:
-        from app.services.prompt_generator import PromptGenerator, DEFAULT_STYLES
+        from app.services.prompt_generator import (
+            PromptGenerator,
+            DEFAULT_STYLES,
+            STYLE_VARIATION_HINTS,
+        )
 
         api_key = get_setting_value(db, "prompt_api_key", "")
         system_prompt = get_setting_value(db, "prompt_system_prompt", "")
@@ -58,11 +144,33 @@ async def _async_generate_prompts(batch_id: str, crowd_type_ids: list):
             return
 
         styles = DEFAULT_STYLES
+
+        ref_image = None
+        if reference_image_id:
+            ref_image = next((img for img in base_images if img.id == reference_image_id), None)
+            if not ref_image:
+                ps.append_log(
+                    TASK_TYPE,
+                    batch_id,
+                    f"[WARN] 指定参考底图不存在或不可用: {reference_image_id[:8]}，将使用默认参考图",
+                )
+        if ref_image is None:
+            ref_image = base_images[0]
+
+        ref_path = ref_image.processed_path or ref_image.original_path
+        reference_context = _summarize_reference_image(ref_path)
         template_count = len(crowd_type_ids) * len(styles)
         task_count = len(base_images) * template_count
 
-        ps.init(TASK_TYPE, batch_id, template_count,
-                f"阶段1: 生成提示词模板 ({len(crowd_type_ids)} 类型 × {len(styles)} 风格 = {template_count} 条)")
+        ps.init(
+            TASK_TYPE,
+            batch_id,
+            template_count,
+            (
+                f"阶段1: 生成提示词模板 ({len(crowd_type_ids)} 类型 × {len(styles)} 风格 = {template_count} 条) "
+                f"| 参考底图: {ref_image.filename}"
+            ),
+        )
         ps.append_log(TASK_TYPE, batch_id,
                       f"阶段2: 为 {len(base_images)} 张底图创建生成任务 (共 {task_count} 个)")
 
@@ -93,7 +201,12 @@ async def _async_generate_prompts(batch_id: str, crowd_type_ids: list):
                     return
                 current_idx += 1
                 try:
-                    positive, negative = await generator.generate_single(ct_id, style)
+                    positive, negative = await generator.generate_single(
+                        ct_id,
+                        style,
+                        reference_context=reference_context,
+                        style_variation_hint=STYLE_VARIATION_HINTS.get(style["name"], ""),
+                    )
 
                     existing = db.query(PromptTemplate).filter(
                         PromptTemplate.crowd_type == ct_id,
@@ -181,12 +294,16 @@ async def _async_generate_prompts(batch_id: str, crowd_type_ids: list):
 
                     if not existing_task:
                         tmpl = template_map.get((ct_id, style["name"]))
+                        task_prompt = _build_task_prompt(
+                            tmpl.positive_prompt if tmpl else "",
+                            style["name"],
+                        )
                         db.add(GenerateTask(
                             base_image_id=img.id,
                             crowd_type=ct_id,
                             style_name=style["name"],
-                            prompt=tmpl.positive_prompt if tmpl else "",
-                            negative_prompt=tmpl.negative_prompt if tmpl else "",
+                            prompt=task_prompt,
+                            negative_prompt=_build_task_negative_prompt(tmpl.negative_prompt if tmpl else ""),
                             ai_engine=default_generate_engine,
                             status="pending",
                         ))
@@ -227,7 +344,7 @@ async def generate_prompts(request: PromptGenerateRequest, db: Session = Depends
 
     t = threading.Thread(
         target=_run_prompt_gen_background,
-        args=(request.batch_id, crowd_type_ids),
+        args=(request.batch_id, crowd_type_ids, request.reference_image_id),
         daemon=True,
     )
     ps.clear_cancel(TASK_TYPE, request.batch_id)
@@ -236,6 +353,7 @@ async def generate_prompts(request: PromptGenerateRequest, db: Session = Depends
     return BaseResponse(code=0, message="提示词生成已启动", data={
         "batch_id": request.batch_id,
         "crowd_types_count": len(crowd_type_ids),
+        "reference_image_id": request.reference_image_id or "",
     })
 
 
@@ -304,6 +422,7 @@ async def edit_prompt(
     prompt_id: str,
     positive_prompt: str = None,
     negative_prompt: str = None,
+    style_name: str = None,
     reference_weight: int = None,
     preferred_engine: str = None,
     db: Session = Depends(get_db)
@@ -317,6 +436,8 @@ async def edit_prompt(
         template.positive_prompt = positive_prompt
     if negative_prompt is not None:
         template.negative_prompt = negative_prompt
+    if style_name is not None:
+        template.style_name = style_name[:255]
     if reference_weight is not None:
         template.reference_weight = max(0, min(100, reference_weight))
     if preferred_engine is not None:
@@ -336,3 +457,27 @@ async def delete_prompt(prompt_id: str, db: Session = Depends(get_db)):
     template.is_active = False
     db.commit()
     return BaseResponse(code=0, message="提示词已删除")
+
+
+@router.delete("/delete-by-crowd/{crowd_type}", response_model=BaseResponse)
+async def delete_prompts_by_crowd(crowd_type: str, db: Session = Depends(get_db)):
+    """按人群类型批量软删除提示词"""
+    if crowd_type not in CROWD_TYPES:
+        raise HTTPException(status_code=400, detail=f"无效的人群类型: {crowd_type}")
+
+    templates = db.query(PromptTemplate).filter(
+        PromptTemplate.crowd_type == crowd_type,
+        PromptTemplate.is_active == True,
+    ).all()
+    if not templates:
+        return BaseResponse(code=0, message="当前人群没有可删除的提示词", data={"deleted_count": 0})
+
+    for tmpl in templates:
+        tmpl.is_active = False
+    db.commit()
+
+    return BaseResponse(
+        code=0,
+        message=f"已删除 {len(templates)} 条提示词",
+        data={"deleted_count": len(templates)},
+    )

@@ -7,6 +7,7 @@ import { Play, RefreshCw, Save, Check, ChevronLeft, ChevronRight, Loader2, Pause
 import { cn } from "@/lib/utils";
 import { widefaceApi, templateApi, toFileUrl, type TemplateItem } from "@/lib/api";
 import { useUpload } from "@/contexts/UploadContext";
+import { useLocation } from "wouter";
 
 interface WideFaceImage {
   id: string;
@@ -19,10 +20,6 @@ interface WideFaceImage {
 
 // 宽脸图适用人群类型：在原5类基础上补充幼女(C01)
 const SINGLE_CROWD_TYPE_IDS = ["C01", "C02", "C03", "C04", "C06", "C07"] as const;
-
-function isWideFaceCompleted(item: TemplateItem): boolean {
-  return item.wide_face_status === "completed" && !!item.wide_face_path;
-}
 
 /** 将 TemplateItem[] 映射为 WideFaceImage[] */
 function templatesToImages(items: TemplateItem[]): WideFaceImage[] {
@@ -38,13 +35,13 @@ function templatesToImages(items: TemplateItem[]): WideFaceImage[] {
 
 export default function WideFace() {
   const { batchId } = useUpload();
+  const [, setLocation] = useLocation();
   const [loading, setLoading] = useState(false);
   const [images, setImages] = useState<WideFaceImage[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [progress, setProgress] = useState(0);
   const [isAllSelected, setIsAllSelected] = useState(true);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const [displayedImages, setDisplayedImages] = useState<string[]>([]);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // 派生计数
@@ -66,12 +63,10 @@ export default function WideFace() {
           const filtered = result.items.filter((t) =>
             SINGLE_CROWD_TYPE_IDS.includes(t.crowd_type as (typeof SINGLE_CROWD_TYPE_IDS)[number]),
           );
-          // 已有宽脸图的模板不应占据“宽脸图生成”工作区
-          const pending = filtered.filter((t) => !isWideFaceCompleted(t));
-          if (pending.length > 0) {
-            const mapped = templatesToImages(pending);
+          if (filtered.length > 0) {
+            const mapped = templatesToImages(filtered);
             setImages(mapped);
-            setDisplayedImages(mapped.map((img) => img.id));
+            setIsAllSelected(mapped.length > 0 && mapped.every((img) => img.selected));
             setLoading(false);
             return;
           }
@@ -100,22 +95,13 @@ export default function WideFace() {
       const filtered = result.items.filter((t) =>
         SINGLE_CROWD_TYPE_IDS.includes(t.crowd_type as (typeof SINGLE_CROWD_TYPE_IDS)[number]),
       );
-      const latestMap = new Map(filtered.map((item) => [item.id, item] as const));
       setImages((prev) => {
-        const merged = prev
-          .map((img) => {
-            const updated = latestMap.get(img.id);
-            if (!updated) return null;
-            return {
-              ...img,
-              crowdType: updated.crowd_name,
-              wideFaceUrl: updated.wide_face_path ? toFileUrl(updated.wide_face_path) : "",
-              wideFaceStatus: updated.wide_face_status,
-            };
-          })
-          .filter((img): img is WideFaceImage => img !== null);
+        const selectedMap = new Map(prev.map((img) => [img.id, img.selected] as const));
+        const merged = templatesToImages(filtered).map((img) => ({
+          ...img,
+          selected: selectedMap.get(img.id) ?? true,
+        }));
         setIsAllSelected(merged.length > 0 && merged.every((img) => img.selected));
-        setDisplayedImages(merged.map((img) => img.id));
         return merged;
       });
     } catch { /* ignore */ }
@@ -251,16 +237,18 @@ export default function WideFace() {
       }
       const remaining = images.filter((img) => !img.selected);
       setImages(remaining);
-      setDisplayedImages((prev) => prev.filter((id) => remaining.some((img) => img.id === id)));
       toast.success(`已保存 ${selected.length} 张宽脸图到选用库`);
       if (remaining.length === 0) {
         setProgress(0);
         setIsGenerating(false);
-        setDisplayedImages([]);
       }
     } catch {
       toast.error("保存失败，请重试");
     }
+  };
+
+  const handleSkipWideFace = () => {
+    setLocation("/process");
   };
 
   // ---- 水平滚动 ----
@@ -292,6 +280,9 @@ export default function WideFace() {
                   中断生成
                 </Button>
               )}
+              <Button variant="outline" onClick={handleSkipWideFace} disabled={isGenerating}>
+                跳过宽脸，直接画面处理
+              </Button>
             </div>
             <span className="text-sm text-muted-foreground">
               选用库 - {SINGLE_CROWD_TYPE_IDS.length}类单人照，共{totalImages}张图片 | 进度: {progressPercentage}% ({completedImages}/{totalImages})
@@ -321,7 +312,7 @@ export default function WideFace() {
               <p className="text-muted-foreground text-lg">
                 {loading ? "正在加载..." : "点击\"开始生成宽脸图\"按钮生成图片"}
               </p>
-              {!loading && <p className="text-sm text-muted-foreground mt-2">选用库中暂无待生成宽脸图</p>}
+              {!loading && <p className="text-sm text-muted-foreground mt-2">选用库中暂无可处理模板图</p>}
             </div>
           </div>
         ) : (
@@ -340,7 +331,6 @@ export default function WideFace() {
             >
               <div className="flex gap-4 px-16 py-4 h-full">
                 {images.map((image) => {
-                  if (!displayedImages.includes(image.id)) return null;
                   const imageUrl = image.wideFaceUrl || image.originalUrl;
                   return (
                     <div

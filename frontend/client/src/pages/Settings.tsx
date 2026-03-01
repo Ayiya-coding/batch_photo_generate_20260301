@@ -281,6 +281,18 @@ export default function Settings() {
                 </Select>
               </div>
             </div>
+            <div className="flex items-center justify-between rounded-md border p-3">
+              <div className="space-y-1">
+                <Label>扩图失败自动降级填充</Label>
+                <p className="text-xs text-muted-foreground">
+                  关闭后，扩图失败会直接报错而不是生成条纹填充图（推荐关闭以避免上下撕扯条纹）
+                </p>
+              </div>
+              <Switch
+                checked={cv(settings, "expand_allow_fallback", "1") === "1"}
+                onCheckedChange={(v) => set("expand_allow_fallback", v ? "1" : "0")}
+              />
+            </div>
           </CardContent>
         </Card>
 
@@ -441,6 +453,10 @@ export default function Settings() {
                 onCheckedChange={(v) => set("strict_no_watermark", v ? "1" : "0")}
               />
             </div>
+            <p className="text-xs text-muted-foreground">
+              若模板页仍出现右下角 “AI generated”，通常不是余额问题，而是上游模型渠道强制角标或去水印引擎不可用。
+              建议同时开启“关闭生图水印 + 强制无水印兜底”，并确保去水印引擎可用。
+            </p>
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">
                 <Label>默认提示词前缀</Label>

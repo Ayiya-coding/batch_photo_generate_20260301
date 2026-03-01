@@ -109,6 +109,10 @@ class PromptGenerateRequest(BaseModel):
     """提示词生成请求"""
     batch_id: str
     crowd_types: Optional[List[str]] = Field(None, description="指定人群类型，不指定则全部")
+    reference_image_id: Optional[str] = Field(
+        None,
+        description="参考底图ID，用于基于底图特征生成提示词",
+    )
 
     @field_validator("batch_id")
     @classmethod
@@ -124,6 +128,13 @@ class PromptGenerateRequest(BaseModel):
         if bad:
             raise ValueError(f"无效的人群类型: {bad}")
         return v
+
+    @field_validator("reference_image_id")
+    @classmethod
+    def _reference_image_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return _check_uuid(v, "reference_image_id")
 
 
 class PromptResponse(BaseModel):

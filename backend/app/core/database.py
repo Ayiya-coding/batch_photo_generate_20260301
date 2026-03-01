@@ -86,7 +86,7 @@ DEFAULT_SETTINGS = [
     # 配置项2：图片扩图配置
     ("target_ratio", "9:16", "目标画面比例"),
     ("expand_engine", "seedream", "扩图引擎(seedream/iopaint/auto)"),
-    ("expand_allow_fallback", "1", "扩图失败时允许降级填充(1=是/0=否)"),
+    ("expand_allow_fallback", "0", "扩图失败时允许降级填充(1=是/0=否)"),
     # 配置项3：提示词生成配置
     ("prompt_api_key", "", "阿里百炼API Key"),
     ("prompt_system_prompt", "", "提示词生成系统Prompt"),

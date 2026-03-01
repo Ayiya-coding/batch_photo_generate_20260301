@@ -205,15 +205,16 @@ export default function PromptConfig() {
     setIsGenerating(true);
     setGenProgress(null);
 
-    const result = await promptApi.generate(batchId!, [expandedType]);
+    const result = await promptApi.generate(batchId!, [expandedType], selectedImageId || undefined);
     if (!result) {
       setIsGenerating(false);
       return;
     }
 
     const typeName = allTypes.find((t) => t.id === expandedType)?.name || expandedType;
+    const selectedImage = images.find((img) => img.id === selectedImageId);
     toast.info("提示词生成已启动", {
-      description: `正在为「${typeName}」生成提示词（${result.crowd_types_count} 种）...`,
+      description: `正在为「${typeName}」生成提示词（参考底图：${selectedImage?.filename || "默认首图"}）...`,
     });
 
     const finalInfo = await pollGenerateProgress(batchId!);
@@ -228,7 +229,7 @@ export default function PromptConfig() {
     } else {
       toast.error("提示词生成失败或超时");
     }
-  }, [batchId, expandedType, pollGenerateProgress, loadPrompts]);
+  }, [batchId, expandedType, selectedImageId, pollGenerateProgress, loadPrompts]);
 
   // ========== 为单个人群类型重新生成 ==========
 
@@ -241,7 +242,7 @@ export default function PromptConfig() {
     setIsGenerating(true);
     setGenProgress(null);
 
-    const result = await promptApi.generate(batchId!, [typeId]);
+    const result = await promptApi.generate(batchId!, [typeId], selectedImageId || undefined);
     if (!result) {
       setIsGenerating(false);
       return;
@@ -262,7 +263,7 @@ export default function PromptConfig() {
     } else {
       toast.error("重新生成失败或超时");
     }
-  }, [batchId, pollGenerateProgress, loadPrompts]);
+  }, [batchId, selectedImageId, pollGenerateProgress, loadPrompts]);
 
   const handleCancelGenerate = useCallback(async () => {
     if (!batchId) return;
@@ -294,7 +295,7 @@ export default function PromptConfig() {
         }
         saveTimerRef.current[promptId] = setTimeout(async () => {
           const data: Record<string, string> = {};
-          if (field === "positive_prompt" || field === "negative_prompt") {
+          if (field === "positive_prompt" || field === "negative_prompt" || field === "style_name") {
             data[field] = value;
           }
           if (Object.keys(data).length > 0) {
@@ -330,6 +331,30 @@ export default function PromptConfig() {
     }));
     toast.info("已删除提示词");
   }, [batchId]);
+
+  const handleDeleteTypePrompts = useCallback(async () => {
+    if (!expandedType) {
+      toast.info("请先选择人群类型");
+      return;
+    }
+
+    const prompts = promptMap[expandedType] || [];
+    if (prompts.length === 0) {
+      toast.info("当前类型暂无可删除的提示词");
+      return;
+    }
+
+    if (!window.confirm(`确定删除当前类型的 ${prompts.length} 条提示词吗？此操作不可撤销。`)) {
+      return;
+    }
+
+    if (batchId) {
+      await promptApi.deleteByCrowd(expandedType);
+    }
+    setPromptMap((prev) => ({ ...prev, [expandedType]: [] }));
+    const typeName = allTypes.find((t) => t.id === expandedType)?.name || expandedType;
+    toast.success(`已清空「${typeName}」提示词`);
+  }, [batchId, expandedType, promptMap]);
 
   // ========== 图片选择 ==========
 
@@ -522,6 +547,15 @@ export default function PromptConfig() {
               </CardTitle>
               {expandedType && (
                 <div className="flex gap-2">
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onClick={handleDeleteTypePrompts}
+                    disabled={isGenerating || currentPrompts.length === 0}
+                  >
+                    <Trash2 className="w-4 h-4 mr-2" />
+                    清空当前类型
+                  </Button>
                   <Button
                     variant="outline"
                     size="sm"

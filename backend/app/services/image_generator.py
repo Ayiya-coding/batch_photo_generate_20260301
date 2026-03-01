@@ -209,15 +209,30 @@ class APIYiImageClient:
         self, headers: dict, prompt: str, negative_prompt: str,
         ref_b64: str, ref_weight: int, output_path: str,
     ) -> bool:
-        """Nano Banana Pro 生图"""
-        _ = (ref_b64, ref_weight)  # 该模型当前渠道的 image 入参稳定性差，先走文本生图
-        payload = {
+        """Nano Banana Pro 生图（优先尝试带参考图，失败再自动回退文本生图）"""
+        payload_base = {
             "model": self.nanobanana_model,
             "prompt": prompt,
             "negative_prompt": negative_prompt,
             "size": self.nanobanana_size,
             "n": 1,
         }
+
+        # 1) 先尝试“参考图+文本”模式，提升人物一致性和编辑可控性
+        if ref_b64:
+            payload_with_ref = dict(payload_base)
+            payload_with_ref["image"] = f"data:image/jpeg;base64,{ref_b64}"
+            payload_with_ref["reference_strength"] = round(max(0, min(100, ref_weight)) / 100.0, 2)
+            self._apply_watermark_options(payload_with_ref)
+            if await self._call_api(headers, payload_with_ref, output_path):
+                return True
+            logger.warning(
+                "NanoBanana 参考图模式失败，回退为纯文本生图 | code=%s",
+                self.last_error_code or "unknown",
+            )
+
+        # 2) 回退为文本生图
+        payload = dict(payload_base)
         self._apply_watermark_options(payload)
         return await self._call_api(headers, payload, output_path)
 
@@ -339,6 +354,7 @@ class ConcurrentImageGenerator:
         nanobanana_model: str = "nano-banana-pro",
         disable_watermark: bool = True,
         strict_no_watermark: bool = True,
+        best_effort_watermark_cleanup: bool = True,
         watermark_cleanup_margin: float = 0.18,
         watermark_engine: str = "auto",
         iopaint_url: str = "",
@@ -357,6 +373,7 @@ class ConcurrentImageGenerator:
             disable_watermark=disable_watermark,
         )
         self.strict_no_watermark = strict_no_watermark
+        self.best_effort_watermark_cleanup = bool(best_effort_watermark_cleanup)
         self.watermark_cleanup_margin = max(0.08, min(0.35, float(watermark_cleanup_margin)))
         self.watermark_engine = _normalize_watermark_engine(watermark_engine)
         self.iopaint_url = (iopaint_url or app_settings.IOPAINT_URL).strip()
@@ -470,6 +487,14 @@ class ConcurrentImageGenerator:
                                     add_reason("watermark_cleanup_exception", self._last_watermark_error)
                             add_reason("strict_no_watermark_cleanup_failed")
                             success = False
+                    elif self.best_effort_watermark_cleanup and self.client.disable_watermark:
+                        clean_ok = await self._force_remove_watermark(output_path)
+                        if not clean_ok:
+                            logger.warning(
+                                "best-effort 去水印未完成，保留当前结果: %s | err=%s",
+                                output_path,
+                                self._last_watermark_error or "unknown",
+                            )
                 else:
                     if self.client.last_error_code:
                         add_reason(self.client.last_error_code, self.client.last_error_message)

@@ -3,6 +3,7 @@ API integration tests — health, compress, export endpoints
 (sync TestClient, no pytest-asyncio needed)
 """
 from starlette.testclient import TestClient
+from app.models.database import Settings
 
 
 # --------------- Health / Root ---------------
@@ -40,6 +41,17 @@ def test_compress_start_no_images(client: TestClient):
     })
     assert resp.status_code == 200
     assert resp.json()["code"] == 0
+
+
+def test_compress_start_disabled_by_setting(client: TestClient, db_session):
+    db_session.add(Settings(key="compress_enabled", value="0"))
+    db_session.commit()
+
+    resp = client.post("/api/compress/start", json={})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 1
+    assert "已关闭" in body["message"]
 
 
 def test_compress_retry_not_found(client: TestClient):

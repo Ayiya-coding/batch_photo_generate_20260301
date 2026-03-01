@@ -248,9 +248,13 @@ export interface PromptItem {
 
 export const promptApi = {
   /** 一键生成提示词 */
-  generate(batchId: string, crowdTypes?: string[]) {
+  generate(batchId: string, crowdTypes?: string[], referenceImageId?: string) {
     return unwrapWithRetry<{ batch_id: string; crowd_types_count: number }>(() =>
-      http.post(API.prompt.generate, { batch_id: batchId, crowd_types: crowdTypes }),
+      http.post(API.prompt.generate, {
+        batch_id: batchId,
+        crowd_types: crowdTypes,
+        reference_image_id: referenceImageId,
+      }),
     );
   },
 
@@ -277,6 +281,7 @@ export const promptApi = {
     data: {
       positive_prompt?: string;
       negative_prompt?: string;
+      style_name?: string;
       reference_weight?: number;
       preferred_engine?: string;
     },
@@ -287,6 +292,11 @@ export const promptApi = {
   /** 删除提示词 */
   delete(promptId: string) {
     return unwrap(http.delete(API.prompt.delete(promptId)));
+  },
+
+  /** 按人群批量删除提示词 */
+  deleteByCrowd(crowdType: string) {
+    return unwrap<{ deleted_count: number }>(http.delete(API.prompt.deleteByCrowd(crowdType)));
   },
 };
 

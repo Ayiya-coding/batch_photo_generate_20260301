@@ -39,6 +39,21 @@ def _normalize_watermark_engine(engine_name: str) -> str:
     return "auto"
 
 
+def _build_wideface_prompt(base_prompt: str) -> str:
+    """
+    构造更强约束的宽脸编辑提示词，避免“基本看不出变宽”。
+    """
+    base = (base_prompt or "").strip()
+    enforced = (
+        "Edit the reference portrait only. Keep the same person identity, hairstyle, outfit, lighting and "
+        "background. Increase face width and jaw width by about 18-25%, keep face height almost unchanged, "
+        "maintain realistic skin texture, no caricature, no body reshaping."
+    )
+    if not base:
+        return enforced
+    return f"{base}. {enforced}"
+
+
 def _run_wideface_background(template_ids: list[str], engine: str):
     """后台线程入口"""
     loop = asyncio.new_event_loop()
@@ -133,14 +148,18 @@ async def _async_wideface_generate(template_ids: list[str], engine: str):
                     out_filename = f"wideface_{tmpl.id}.jpg"
                     out_path = str(settings.GENERATED_DIR / out_filename)
 
-                    prompt = f"{wideface_prompt}, based on the original photo, generate a wider face version"
+                    prompt = _build_wideface_prompt(wideface_prompt)
+                    negative_prompt = (
+                        "slim face, narrow jaw, thin cheeks, tiny face, deformed anatomy, big head, "
+                        "cartoon, blurry, low quality, text, watermark"
+                    )
 
                     success, fail_detail, fail_codes = await generator.generate_single_with_retry_detail(
                         engine=engine,
                         prompt=prompt,
-                        negative_prompt="distorted, deformed, ugly, blurry",
+                        negative_prompt=negative_prompt,
                         reference_image_path=tmpl.original_path,
-                        reference_weight=90,
+                        reference_weight=95,
                         output_path=out_path,
                     )
 

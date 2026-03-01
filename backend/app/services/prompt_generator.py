@@ -26,6 +26,15 @@ DEFAULT_STYLES = [
     {"name": "科幻未来", "desc": "赛博朋克风格，未来感服装，霓虹灯光都市背景"},
 ]
 
+# 人物造型多样化方向（同风格内也要有造型变化）
+STYLE_VARIATION_HINTS = {
+    "古典东方": "强调汉服层次、发髻与发簪、袖型与腰封变化；保持背景与机位稳定，但人物身份与面部需重建为目标人群",
+    "古典西方": "强调宫廷礼服剪裁、发型卷度、珠宝与手套变化；保持背景与机位稳定，但人物身份与面部需重建为目标人群",
+    "现代都市": "强调日常穿搭、妆发细节、配饰与姿态微动作变化；保持背景与机位稳定，但人物身份与面部需重建为目标人群",
+    "自然清新": "强调轻盈服饰、自然发型、道具与表情变化；保持背景与机位稳定，但人物身份与面部需重建为目标人群",
+    "科幻未来": "强调材质与光泽、发色与装置配饰变化；保持背景与机位稳定，但人物身份与面部需重建为目标人群",
+}
+
 # 人群类型详细描述（用于提示词生成）
 CROWD_DESCRIPTIONS = {
     "C01": "4-12岁女童，天真可爱，童趣活泼",
@@ -63,6 +72,7 @@ class PromptGenerator:
     def _default_system_prompt() -> str:
         return """你是一个专业的AI绘画提示词生成专家。
 你需要根据用户提供的人群类型和风格，生成高质量的图像生成提示词。
+你必须以“参考底图”的背景为基础：保持背景场景、构图、机位、透视和光线稳定，但不要继承底图人物身份与五官，需要按目标人群重建人物脸和身份。
 
 提示词要求：
 1. 使用英文
@@ -79,22 +89,38 @@ class PromptGenerator:
 - 负向提示词简洁，列出需要避免的元素"""
 
     def _build_user_prompt(
-        self, crowd_type_id: str, style: Dict[str, str]
+        self,
+        crowd_type_id: str,
+        style: Dict[str, str],
+        reference_context: str = "",
+        style_variation_hint: str = "",
     ) -> str:
         crowd_name = CROWD_TYPES.get(crowd_type_id, "未知")
         crowd_desc = CROWD_DESCRIPTIONS.get(crowd_type_id, "")
+        ref_block = f"\n参考底图特征：{reference_context}" if reference_context else ""
+        variation_block = (
+            f"\n造型变化方向：{style_variation_hint}"
+            if style_variation_hint
+            else "\n造型变化方向：保持背景场景与机位稳定，人物身份与面部重建为目标人群，优先变化服装/发型/配饰/妆容，避免重复造型"
+        )
         return f"""请为以下组合生成一个图像生成提示词：
 
 人群类型：{crowd_name}（{crowd_desc}）
 风格：{style['name']}（{style['desc']}）
+{ref_block}{variation_block}
 
 要求：
 - 输出英文正向提示词 + 负向提示词
 - 正向提示词和负向提示词用 "---NEGATIVE---" 分隔
-- 适合生成9:16比例的人物写真"""
+- 适合生成9:16比例的人物写真
+- 明确要求“仅参考底图背景（场景/机位/光线），不要继承底图人物脸和身份，按目标人群重建人物”"""
 
     async def generate_single(
-        self, crowd_type_id: str, style: Dict[str, str]
+        self,
+        crowd_type_id: str,
+        style: Dict[str, str],
+        reference_context: str = "",
+        style_variation_hint: str = "",
     ) -> Tuple[str, str]:
         """
         生成单条提示词
@@ -105,7 +131,12 @@ class PromptGenerator:
         if not self.api_key:
             raise ValueError("百炼 API Key 未配置，请在系统设置中填写")
 
-        user_prompt = self._build_user_prompt(crowd_type_id, style)
+        user_prompt = self._build_user_prompt(
+            crowd_type_id,
+            style,
+            reference_context=reference_context,
+            style_variation_hint=style_variation_hint,
+        )
 
         payload = {
             "model": self.model,
@@ -148,6 +179,7 @@ class PromptGenerator:
         self,
         crowd_type_ids: Optional[List[str]] = None,
         styles: Optional[List[Dict[str, str]]] = None,
+        reference_context: str = "",
         progress_callback=None,
     ) -> List[Dict]:
         """
@@ -175,7 +207,12 @@ class PromptGenerator:
             for style in styles:
                 current += 1
                 try:
-                    positive, negative = await self.generate_single(ct_id, style)
+                    positive, negative = await self.generate_single(
+                        ct_id,
+                        style,
+                        reference_context=reference_context,
+                        style_variation_hint=STYLE_VARIATION_HINTS.get(style.get("name", ""), ""),
+                    )
                     results.append({
                         "crowd_type": ct_id,
                         "style_name": style["name"],

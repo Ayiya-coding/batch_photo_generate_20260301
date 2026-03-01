@@ -137,6 +137,10 @@ async def start_compress(request: CompressRequest, db: Session = Depends(get_db)
     if ps.is_running(TASK_TYPE, TASK_KEY):
         return BaseResponse(code=1, message="压缩任务正在进行中")
 
+    compress_enabled = str(get_setting_value(db, "compress_enabled", "1")).strip() == "1"
+    if not compress_enabled:
+        return BaseResponse(code=1, message="画质压缩功能已关闭，请在系统设置中开启后重试")
+
     # 读取配置
     target_kb = request.target_size_kb or int(get_setting_value(db, "compress_target_size", "500"))
     min_q = request.min_quality or int(get_setting_value(db, "compress_min_quality", "60"))
