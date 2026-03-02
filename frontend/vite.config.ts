@@ -4,6 +4,7 @@ import path from "node:path";
 import { defineConfig } from "vite";
 
 const plugins = [react(), tailwindcss()];
+const apiProxyTarget = process.env.VITE_API_PROXY_TARGET || "http://localhost:8000";
 
 export default defineConfig({
   plugins,
@@ -26,7 +27,7 @@ export default defineConfig({
     allowedHosts: true,
     proxy: {
       "/api": {
-        target: "http://localhost:8000",
+        target: apiProxyTarget,
         changeOrigin: true,
       },
     },

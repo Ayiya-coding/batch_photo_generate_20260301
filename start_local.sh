@@ -13,6 +13,7 @@ ENV_EXAMPLE="$ROOT_DIR/.env.example"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-3000}"
 IOPAINT_PORT="${IOPAINT_PORT:-8090}"
+VITE_API_PROXY_TARGET="${VITE_API_PROXY_TARGET:-http://127.0.0.1:${BACKEND_PORT}}"
 
 USE_IOPAINT="${USE_IOPAINT:-auto}" # auto | 1 | 0
 NO_INSTALL=0
@@ -276,7 +277,7 @@ function start_frontend() {
   log "Starting frontend on port $FRONTEND_PORT..."
   (
     cd "$ROOT_DIR/frontend"
-    nohup npm run dev -- --host 0.0.0.0 --port "$FRONTEND_PORT" >"$FRONTEND_LOG" 2>&1 &
+    nohup env VITE_API_PROXY_TARGET="$VITE_API_PROXY_TARGET" npm run dev -- --host 0.0.0.0 --port "$FRONTEND_PORT" >"$FRONTEND_LOG" 2>&1 &
     echo "$!" > "$FRONTEND_PID_FILE"
   )
   local pid
@@ -352,6 +353,7 @@ echo
 echo "==================== STARTED ===================="
 echo "Frontend : http://localhost:${FRONTEND_PORT}"
 echo "Backend  : http://localhost:${BACKEND_PORT}"
+echo "API Proxy: ${VITE_API_PROXY_TARGET}"
 if [[ "$USE_IOPAINT" == "1" ]]; then
   echo "IOPaint  : http://localhost:${IOPAINT_PORT}"
 fi
