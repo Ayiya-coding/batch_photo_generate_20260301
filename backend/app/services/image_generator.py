@@ -108,6 +108,39 @@ class APIYiImageClient:
             "opacity": 0.3,
         }
 
+    def _load_reference_base64(self, reference_image_path: str) -> str:
+        """
+        读取并压缩参考图，避免请求体过大触发上游 multipart buffer 限制。
+        """
+        if not reference_image_path or not Path(reference_image_path).exists():
+            return ""
+        image = cv2.imread(reference_image_path)
+        if image is None:
+            return ""
+
+        h, w = image.shape[:2]
+        max_edge = max(h, w)
+        target_max_edge = 1280
+        if max_edge > target_max_edge:
+            scale = target_max_edge / float(max_edge)
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        quality = 82
+        ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            return ""
+
+        # 兜底再压一次，减少 400 invalid_image_request 概率
+        if len(buf) > 700 * 1024:
+            quality = 70
+            ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            if not ok:
+                return ""
+
+        return base64.b64encode(buf.tobytes()).decode("utf-8")
+
     async def generate_image(
         self,
         engine: str,
@@ -140,13 +173,8 @@ class APIYiImageClient:
             "Content-Type": "application/json",
         }
 
-        # 读取参考图片
-        ref_b64 = ""
-        if reference_image_path and Path(reference_image_path).exists():
-            image = cv2.imread(reference_image_path)
-            if image is not None:
-                _, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                ref_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+        # 读取并压缩参考图片
+        ref_b64 = self._load_reference_base64(reference_image_path)
 
         if engine == "seedream":
             ok = await self._generate_seedream(

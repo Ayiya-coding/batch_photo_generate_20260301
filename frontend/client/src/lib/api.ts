@@ -246,6 +246,16 @@ export interface PromptItem {
   task_count: number;
 }
 
+export interface PromptCreatePayload {
+  crowd_type: string;
+  style_name: string;
+  positive_prompt: string;
+  negative_prompt?: string;
+  reference_weight?: number;
+  preferred_engine?: "seedream" | "nanobanana";
+  is_active?: boolean;
+}
+
 export const promptApi = {
   /** 一键生成提示词 */
   generate(batchId: string, crowdTypes?: string[], referenceImageId?: string, promptCount = 5) {
@@ -298,6 +308,30 @@ export const promptApi = {
   /** 按人群批量删除提示词 */
   deleteByCrowd(crowdType: string) {
     return unwrap<{ deleted_count: number }>(http.delete(API.prompt.deleteByCrowd(crowdType)));
+  },
+
+  /** 新增提示词 */
+  create(payload: PromptCreatePayload) {
+    return unwrap<{ id: string; updated: boolean }>(http.post(API.prompt.create, payload));
+  },
+
+  /** 导入提示词模板（CSV/JSON） */
+  importTemplates(file: File, crowdType?: string, replaceCurrent = false) {
+    const form = new FormData();
+    form.append("file", file);
+    if (crowdType) form.append("crowd_type", crowdType);
+    form.append("replace_current", replaceCurrent ? "true" : "false");
+    return unwrap<{
+      created_count: number;
+      updated_count: number;
+      error_count: number;
+      errors: string[];
+      affected_crowds: string[];
+    }>(
+      http.post(API.prompt.import, form, {
+        headers: { "Content-Type": "multipart/form-data" },
+      }),
+    );
   },
 };
 

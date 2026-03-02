@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, type ChangeEvent } from "react";
 import { MainLayout } from "@/components/layout";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -7,26 +7,35 @@ import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { toast } from "sonner";
 import {
-  Wand2, Save, ChevronRight, ChevronDown,
-  Trash2, Edit3, Sparkles, RefreshCw, ImageIcon, Loader2, Pause,
+  Wand2,
+  Save,
+  ChevronRight,
+  ChevronDown,
+  Trash2,
+  Edit3,
+  ImageIcon,
+  Loader2,
+  Pause,
+  Plus,
+  Upload,
+  Download,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useUpload } from "@/contexts/UploadContext";
 import {
-  uploadApi, promptApi, toFileUrl,
-  type PromptItem, type ProgressInfo,
+  uploadApi,
+  promptApi,
+  toFileUrl,
+  type PromptItem,
+  type ProgressInfo,
 } from "@/lib/api";
-
-// ========== 类型 & 常量 ==========
 
 interface BaseImageInfo {
   id: string;
   filename: string;
   thumbnail: string;
-  status: string;
 }
 
-/** 人群类型（与后端 constants.py 保持一致） */
 const crowdTypes = {
   single: [
     { id: "C01", name: "幼女", desc: "4-12岁女童" },
@@ -55,7 +64,6 @@ const crowdTypes = {
 
 const allTypes = [...crowdTypes.single, ...crowdTypes.combo];
 
-/** 按 crowd_type 分组 PromptItem[] */
 function groupByCrowdType(prompts: PromptItem[]): Record<string, PromptItem[]> {
   const map: Record<string, PromptItem[]> = {};
   for (const p of prompts) {
@@ -64,34 +72,39 @@ function groupByCrowdType(prompts: PromptItem[]): Record<string, PromptItem[]> {
   return map;
 }
 
-
-// ========== 组件 ==========
-
 export default function PromptConfig() {
   const { batchId } = useUpload();
 
-  // --- 底图列表 ---
   const [images, setImages] = useState<BaseImageInfo[]>([]);
   const [selectedImageId, setSelectedImageId] = useState<string>("");
 
-  // --- 提示词数据 ---
   const [promptMap, setPromptMap] = useState<Record<string, PromptItem[]>>({});
   const [expandedType, setExpandedType] = useState<string | null>("C02");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [promptCount, setPromptCount] = useState(5);
 
-  // --- 生成进度 ---
   const [isGenerating, setIsGenerating] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
   const [genProgress, setGenProgress] = useState<ProgressInfo | null>(null);
 
-  // --- 加载状态 ---
   const [loadingImages, setLoadingImages] = useState(false);
   const [loadingPrompts, setLoadingPrompts] = useState(false);
 
-  // 防抖保存 timer
   const saveTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const importInputRef = useRef<HTMLInputElement | null>(null);
 
-  // ========== 初始化：加载底图列表 ==========
+  const loadPrompts = useCallback(async () => {
+    if (!batchId) {
+      setPromptMap({});
+      return;
+    }
+    setLoadingPrompts(true);
+    const result = await promptApi.list({ batch_id: batchId });
+    if (result) {
+      setPromptMap(groupByCrowdType(result.prompts));
+    }
+    setLoadingPrompts(false);
+  }, [batchId]);
 
   useEffect(() => {
     if (!batchId) {
@@ -99,7 +112,6 @@ export default function PromptConfig() {
       setSelectedImageId("");
       return;
     }
-
     let cancelled = false;
     (async () => {
       setLoadingImages(true);
@@ -112,51 +124,34 @@ export default function PromptConfig() {
             id: img.id,
             filename: img.filename,
             thumbnail: toFileUrl(img.processed_path || img.original_path),
-            status: img.status,
           }));
         setImages(completed);
-        if (completed.length > 0) setSelectedImageId(completed[0].id);
+        if (completed.length > 0) {
+          setSelectedImageId((prev) => prev || completed[0].id);
+        }
       }
       setLoadingImages(false);
     })();
-    return () => { cancelled = true; };
-  }, [batchId]);
-
-  // ========== 初始化：加载提示词列表 ==========
-
-  const loadPrompts = useCallback(async () => {
-    if (!batchId) {
-      setPromptMap({});
-      return;
-    }
-    setLoadingPrompts(true);
-    const result = await promptApi.list({ batch_id: batchId! });
-    if (result) {
-      setPromptMap(groupByCrowdType(result.prompts));
-    }
-    setLoadingPrompts(false);
+    return () => {
+      cancelled = true;
+    };
   }, [batchId]);
 
   useEffect(() => {
     loadPrompts();
   }, [loadPrompts]);
 
-  // ========== 生成当前选中类型 ==========
-
   const pollGenerateProgress = useCallback(async (bid: string) => {
     const POLL_INTERVAL = 2000;
-    const MAX_POLLS = 300;
-
+    const MAX_POLLS = 180;
     let polls = 0;
+
     while (polls < MAX_POLLS) {
       await new Promise((r) => setTimeout(r, POLL_INTERVAL));
       polls++;
-
       const info = await promptApi.progress(bid);
-      if (!info) break;
-
+      if (!info) return null;
       setGenProgress(info);
-
       if (info.status === "completed" || info.status === "error" || info.status === "cancelled") {
         return info;
       }
@@ -164,56 +159,54 @@ export default function PromptConfig() {
     return null;
   }, []);
 
-  // ========== 刷新恢复：检查是否有正在运行的提示词生成任务 ==========
   useEffect(() => {
     if (!batchId) return;
     let cancelled = false;
     (async () => {
-      try {
-        const info = await promptApi.progress(batchId);
+      const info = await promptApi.progress(batchId);
+      if (cancelled || !info) return;
+      if (info.status === "running" || info.status === "cancelling") {
+        setIsGenerating(true);
+        setGenProgress(info);
+        const finalInfo = await pollGenerateProgress(batchId);
         if (cancelled) return;
-        if (info && info.status === "running") {
-          setIsGenerating(true);
-          setGenProgress(info);
-          const finalInfo = await pollGenerateProgress(batchId);
-          if (cancelled) return;
-          setIsGenerating(false);
-          if (finalInfo?.status === "completed") {
-            toast.success("提示词生成完成！");
-            loadPrompts();
-          } else if (finalInfo?.status === "cancelled") {
-            toast.info("提示词生成已中断");
-            loadPrompts();
-          } else {
-            toast.error("提示词生成失败或超时");
-          }
+        setIsGenerating(false);
+        if (finalInfo?.status === "completed") {
+          await loadPrompts();
         }
-      } catch { /* ignore */ }
+      }
     })();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [batchId, pollGenerateProgress, loadPrompts]);
 
-  const handleGenerateSelected = useCallback(async () => {
+  const handleApplyCurrentType = useCallback(async () => {
     if (!batchId) {
-      toast.info("演示模式：无法调用后端生成");
+      toast.info("请先完成素材上传");
       return;
     }
     if (!expandedType) {
-      toast.info("请先选择一个人群类型");
+      toast.info("请先选择人群类型");
       return;
     }
     if (!crowdTypes.single.some((t) => t.id === expandedType)) {
-      toast.info("当前版本仅支持单人7类，组合人群暂未开放");
+      toast.info("当前版本仅支持单人7类");
       return;
     }
 
-    const normalizedPromptCount = Math.max(1, Math.min(20, Number.isFinite(promptCount) ? promptCount : 5));
+    const currentPrompts = promptMap[expandedType] || [];
+    if (currentPrompts.length === 0) {
+      toast.error("当前类型没有可用提示词，请先新增或导入");
+      return;
+    }
 
+    const normalizedPromptCount = Math.max(1, Math.min(20, Number(promptCount) || 5));
     setIsGenerating(true);
     setGenProgress(null);
 
     const result = await promptApi.generate(
-      batchId!,
+      batchId,
       [expandedType],
       selectedImageId || undefined,
       normalizedPromptCount,
@@ -224,126 +217,60 @@ export default function PromptConfig() {
     }
 
     const typeName = allTypes.find((t) => t.id === expandedType)?.name || expandedType;
-    const selectedImage = images.find((img) => img.id === selectedImageId);
-    toast.info("提示词生成已启动", {
-      description: `正在为「${typeName}」生成 ${normalizedPromptCount} 条提示词（参考底图：${selectedImage?.filename || "默认首图"}）...`,
+    toast.info("已开始创建生图任务", {
+      description: `类型「${typeName}」，本次使用 ${normalizedPromptCount} 条词库模板`,
     });
 
-    const finalInfo = await pollGenerateProgress(batchId!);
+    const finalInfo = await pollGenerateProgress(batchId);
     setIsGenerating(false);
-
     if (finalInfo?.status === "completed") {
-      toast.success(`「${typeName}」提示词生成完成！`);
+      toast.success("任务创建完成，可前往「批量生图」执行生成");
       await loadPrompts();
     } else if (finalInfo?.status === "cancelled") {
-      toast.info(`「${typeName}」提示词生成已中断`);
-      await loadPrompts();
+      toast.info("任务创建已中断");
     } else {
-      toast.error("提示词生成失败或超时");
+      toast.error("任务创建失败或超时");
     }
-  }, [batchId, expandedType, selectedImageId, pollGenerateProgress, loadPrompts, promptCount]);
-
-  // ========== 为单个人群类型重新生成 ==========
-
-  const handleRegenerate = useCallback(async (typeId: string) => {
-    if (!batchId) {
-      toast.info("演示模式：无法调用后端生成");
-      return;
-    }
-
-    if (!crowdTypes.single.some((t) => t.id === typeId)) {
-      toast.info("当前版本仅支持单人7类，组合人群暂未开放");
-      return;
-    }
-
-    const normalizedPromptCount = Math.max(1, Math.min(20, Number.isFinite(promptCount) ? promptCount : 5));
-
-    setIsGenerating(true);
-    setGenProgress(null);
-
-    const result = await promptApi.generate(
-      batchId!,
-      [typeId],
-      selectedImageId || undefined,
-      normalizedPromptCount,
-    );
-    if (!result) {
-      setIsGenerating(false);
-      return;
-    }
-
-    const typeName = allTypes.find((t) => t.id === typeId)?.name || typeId;
-    toast.info(`正在为「${typeName}」重新生成 ${normalizedPromptCount} 条提示词...`);
-
-    const finalInfo = await pollGenerateProgress(batchId!);
-    setIsGenerating(false);
-
-    if (finalInfo?.status === "completed") {
-      toast.success(`「${typeName}」提示词已重新生成`);
-      await loadPrompts();
-    } else if (finalInfo?.status === "cancelled") {
-      toast.info(`「${typeName}」提示词生成已中断`);
-      await loadPrompts();
-    } else {
-      toast.error("重新生成失败或超时");
-    }
-  }, [batchId, selectedImageId, pollGenerateProgress, loadPrompts, promptCount]);
+  }, [batchId, expandedType, pollGenerateProgress, promptCount, promptMap, selectedImageId, loadPrompts]);
 
   const handleCancelGenerate = useCallback(async () => {
     if (!batchId) return;
     const result = await promptApi.cancel(batchId);
     if (result !== undefined) {
-      toast.info("已发送中断请求，任务将在安全点停止");
+      toast.info("已发送中断请求");
     }
   }, [batchId]);
 
-  // ========== 编辑提示词（防抖自动保存） ==========
-
   const handleUpdatePrompt = useCallback(
     (promptId: string, field: "positive_prompt" | "negative_prompt" | "style_name", value: string) => {
-      // 立即更新本地状态
       setPromptMap((prev) => {
         const next = { ...prev };
         for (const key of Object.keys(next)) {
-          next[key] = next[key].map((p) =>
-            p.id === promptId ? { ...p, [field]: value } : p
-          );
+          next[key] = next[key].map((p) => (p.id === promptId ? { ...p, [field]: value } : p));
         }
         return next;
       });
 
-      // 防抖调用后端保存
-      if (batchId) {
-        if (saveTimerRef.current[promptId]) {
-          clearTimeout(saveTimerRef.current[promptId]);
-        }
-        saveTimerRef.current[promptId] = setTimeout(async () => {
-          const data: Record<string, string> = {};
-          if (field === "positive_prompt" || field === "negative_prompt" || field === "style_name") {
-            data[field] = value;
-          }
-          if (Object.keys(data).length > 0) {
-            await promptApi.edit(promptId, data);
-          }
-          delete saveTimerRef.current[promptId];
-        }, 800);
+      if (!batchId) return;
+      if (saveTimerRef.current[promptId]) {
+        clearTimeout(saveTimerRef.current[promptId]);
       }
+      saveTimerRef.current[promptId] = setTimeout(async () => {
+        const data: Record<string, string> = { [field]: value };
+        await promptApi.edit(promptId, data);
+        delete saveTimerRef.current[promptId];
+      }, 700);
     },
     [batchId],
   );
 
-  // ========== 手动保存（清空防抖队列） ==========
-
-  const handleSave = useCallback(async () => {
-    // 清空所有待保存的防抖 timer
+  const handleSave = useCallback(() => {
     for (const [id, timer] of Object.entries(saveTimerRef.current)) {
       clearTimeout(timer);
       delete saveTimerRef.current[id];
     }
-    toast.success("保存成功", { description: "提示词配置已保存" });
+    toast.success("提示词已保存");
   }, []);
-
-  // ========== 删除提示词 ==========
 
   const handleDeletePrompt = useCallback(async (typeId: string, promptId: string) => {
     if (batchId) {
@@ -361,58 +288,131 @@ export default function PromptConfig() {
       toast.info("请先选择人群类型");
       return;
     }
-
     const prompts = promptMap[expandedType] || [];
     if (prompts.length === 0) {
-      toast.info("当前类型暂无可删除的提示词");
+      toast.info("当前类型暂无提示词");
       return;
     }
-
-    if (!window.confirm(`确定删除当前类型的 ${prompts.length} 条提示词吗？此操作不可撤销。`)) {
-      return;
-    }
-
+    const ok = window.confirm(`确定清空「${allTypes.find((t) => t.id === expandedType)?.name || expandedType}」全部提示词吗？`);
+    if (!ok) return;
     if (batchId) {
       await promptApi.deleteByCrowd(expandedType);
     }
     setPromptMap((prev) => ({ ...prev, [expandedType]: [] }));
-    const typeName = allTypes.find((t) => t.id === expandedType)?.name || expandedType;
-    toast.success(`已清空「${typeName}」提示词`);
+    toast.success("已清空当前类型");
   }, [batchId, expandedType, promptMap]);
 
-  // ========== 图片选择 ==========
-
-  const handleImageSelect = useCallback((imageId: string) => {
-    setSelectedImageId(imageId);
-    const img = images.find((i) => i.id === imageId);
-    if (img) {
-      toast.info("已切换底图", { description: `当前选中: ${img.filename}` });
+  const handleAddPrompt = useCallback(async () => {
+    if (!expandedType) {
+      toast.info("请先选择人群类型");
+      return;
     }
-  }, [images]);
+    if (!batchId) {
+      toast.error("请先上传并选择一个批次");
+      return;
+    }
+    const typeName = allTypes.find((t) => t.id === expandedType)?.name || expandedType;
+    const currentCount = (promptMap[expandedType] || []).length;
+    const styleName = `${typeName}穿搭${String(currentCount + 1).padStart(2, "0")}`;
 
-  // ========== 辅助 ==========
+    const positive = `人物类型：${typeName}。保持原图背景、光影、景点和机位完全一致，仅替换人物主体；重点描述服装款式、面料层次、发型、配饰、动作pose、景别和站位。`;
+    const negative = "禁止更换背景地点、禁止改变光影方向、禁止多人物、禁止遮挡脸部";
+
+    const created = await promptApi.create({
+      crowd_type: expandedType,
+      style_name: styleName,
+      positive_prompt: positive,
+      negative_prompt: negative,
+      reference_weight: 90,
+      preferred_engine: "seedream",
+      is_active: true,
+    });
+    if (created) {
+      toast.success("已新增提示词，请继续编辑细节");
+      await loadPrompts();
+    }
+  }, [batchId, expandedType, promptMap, loadPrompts]);
+
+  const handleDownloadTemplate = useCallback(() => {
+    const fallbackType = expandedType || "C02";
+    const typeName = allTypes.find((t) => t.id === fallbackType)?.name || fallbackType;
+    const csvContent = [
+      "crowd_type,style_name,positive_prompt,negative_prompt,reference_weight,preferred_engine,is_active",
+      `${fallbackType},"${typeName}穿搭01","保持原图背景和光影不变，仅替换${typeName}人物主体；服装：新中式套装，发型：简洁盘发，姿态：自然站立，景别：半身，站位：画面右侧三分之一","背景替换,地标变更,多人物,脸部遮挡",90,seedream,true`,
+      `${fallbackType},"${typeName}穿搭02","保持原图背景和光影不变，仅替换${typeName}人物主体；服装：都市轻通勤，发型：低马尾，姿态：扶栏轻倚，景别：全身，站位：前景偏左","背景替换,地标变更,多人物,脸部遮挡",90,seedream,true`,
+    ].join("\n");
+
+    const blob = new Blob(["\uFEFF" + csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "prompt-template.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+    toast.success("已下载导入模板");
+  }, [expandedType]);
+
+  const handleImportClick = useCallback(() => {
+    importInputRef.current?.click();
+  }, []);
+
+  const handleImportChange = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    if (!batchId) {
+      toast.error("请先上传并选择一个批次");
+      event.target.value = "";
+      return;
+    }
+
+    const targetType = expandedType || undefined;
+    const replaceCurrent = !!targetType
+      && window.confirm("是否覆盖当前人群已有词条？选择“取消”则为追加导入。");
+
+    setIsImporting(true);
+    const result = await promptApi.importTemplates(file, targetType, replaceCurrent);
+    setIsImporting(false);
+    event.target.value = "";
+
+    if (result) {
+      toast.success(`导入完成：新增 ${result.created_count}，更新 ${result.updated_count}`);
+      if (result.error_count > 0) {
+        toast.warning(`有 ${result.error_count} 行导入失败，请检查模板格式`);
+      }
+      await loadPrompts();
+    }
+  }, [batchId, expandedType, loadPrompts]);
 
   const getTypePromptCount = (typeId: string) => promptMap[typeId]?.length || 0;
   const currentPrompts = expandedType ? (promptMap[expandedType] || []) : [];
 
-  // ========== 渲染 ==========
-
   return (
     <MainLayout
-      title="提示词"
+      title="提示词词库"
       actions={
         <div className="flex items-center gap-3">
           {isGenerating && genProgress && (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <Loader2 className="w-4 h-4 animate-spin" />
-              <span>
-                {genProgress.progress}% ({genProgress.completed}/{genProgress.total})
-              </span>
+              <span>{genProgress.progress}% ({genProgress.completed}/{genProgress.total})</span>
             </div>
           )}
           <Button variant="outline" size="sm" onClick={handleSave}>
             <Save className="w-4 h-4 mr-2" />
             保存配置
+          </Button>
+          <Button variant="outline" size="sm" onClick={handleDownloadTemplate}>
+            <Download className="w-4 h-4 mr-2" />
+            下载模板
+          </Button>
+          <Button variant="outline" size="sm" onClick={handleImportClick} disabled={isImporting}>
+            {isImporting ? (
+              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+            ) : (
+              <Upload className="w-4 h-4 mr-2" />
+            )}
+            导入词库
           </Button>
           {isGenerating && (
             <Button variant="destructive" size="sm" onClick={handleCancelGenerate}>
@@ -420,16 +420,16 @@ export default function PromptConfig() {
               中断
             </Button>
           )}
-          <Button size="sm" onClick={handleGenerateSelected} disabled={isGenerating || !expandedType}>
+          <Button size="sm" onClick={handleApplyCurrentType} disabled={isGenerating || !expandedType}>
             {isGenerating ? (
               <Loader2 className="w-4 h-4 mr-2 animate-spin" />
             ) : (
               <Wand2 className="w-4 h-4 mr-2" />
             )}
-            {isGenerating ? "生成中..." : "生成当前类型"}
+            {isGenerating ? "创建中..." : "按当前词库创建任务"}
           </Button>
           <div className="flex items-center gap-2">
-            <span className="text-xs text-muted-foreground">提示词数量</span>
+            <span className="text-xs text-muted-foreground">本次使用条数</span>
             <Input
               type="number"
               min={1}
@@ -447,8 +447,15 @@ export default function PromptConfig() {
         </div>
       }
     >
+      <input
+        ref={importInputRef}
+        type="file"
+        className="hidden"
+        accept=".csv,.json"
+        onChange={handleImportChange}
+      />
+
       <div className="flex gap-4 h-[calc(100vh-140px)]">
-        {/* 最左侧：预处理后的图片列表 */}
         <Card className="w-[140px] shrink-0 flex flex-col">
           <CardHeader className="py-2 px-3 shrink-0">
             <CardTitle className="text-base flex items-center gap-1">
@@ -471,9 +478,9 @@ export default function PromptConfig() {
                         "relative cursor-pointer rounded-lg overflow-hidden transition-all duration-200",
                         selectedImageId === image.id
                           ? "ring-2 ring-primary ring-offset-2"
-                          : "hover:ring-2 hover:ring-muted-foreground/30"
+                          : "hover:ring-2 hover:ring-muted-foreground/30",
                       )}
-                      onClick={() => handleImageSelect(image.id)}
+                      onClick={() => setSelectedImageId(image.id)}
                     >
                       <div className="aspect-[2/3] relative bg-muted">
                         <img
@@ -488,9 +495,7 @@ export default function PromptConfig() {
                     </div>
                   ))}
                   {images.length === 0 && (
-                    <p className="text-xs text-muted-foreground text-center py-4">
-                      暂无底图
-                    </p>
+                    <p className="text-xs text-muted-foreground text-center py-4">暂无底图</p>
                   )}
                 </div>
               )}
@@ -498,7 +503,6 @@ export default function PromptConfig() {
           </CardContent>
         </Card>
 
-        {/* 中间：人群类型选择 */}
         <Card className="w-[280px] shrink-0 flex flex-col">
           <CardHeader className="py-2 shrink-0">
             <CardTitle className="text-base">人群类型</CardTitle>
@@ -507,25 +511,21 @@ export default function PromptConfig() {
             <ScrollArea className="h-full">
               <div className="px-4 pb-4">
                 <div className="mb-4">
-                  <h4 className="text-sm font-medium text-muted-foreground mb-2 px-2">
-                    单人类型（7种）
-                  </h4>
+                  <h4 className="text-sm font-medium text-muted-foreground mb-2 px-2">单人类型（7种）</h4>
                   <div className="space-y-1">
                     {crowdTypes.single.map((type) => (
                       <div
                         key={type.id}
                         className={cn(
                           "flex items-center gap-3 px-3 py-2 rounded-lg cursor-pointer transition-colors",
-                          expandedType === type.id ? "bg-accent" : "hover:bg-muted"
+                          expandedType === type.id ? "bg-accent" : "hover:bg-muted",
                         )}
                         onClick={() => setExpandedType(expandedType === type.id ? null : type.id)}
                       >
                         <div className="flex-1">
                           <div className="flex items-center justify-between">
                             <span className="text-sm font-medium">{type.name}</span>
-                            <span className="text-xs text-muted-foreground">
-                              {getTypePromptCount(type.id)} 个
-                            </span>
+                            <span className="text-xs text-muted-foreground">{getTypePromptCount(type.id)} 个</span>
                           </div>
                         </div>
                         {expandedType === type.id ? (
@@ -547,17 +547,20 @@ export default function PromptConfig() {
           </CardContent>
         </Card>
 
-        {/* 右侧：提示词编辑区 */}
         <Card className="flex-1 flex flex-col">
           <CardHeader className="py-2 shrink-0">
             <div className="flex items-center justify-between">
               <CardTitle className="text-base">
                 {expandedType
-                  ? `${allTypes.find((t) => t.id === expandedType)?.name} - 提示词列表`
+                  ? `${allTypes.find((t) => t.id === expandedType)?.name} - 词库列表`
                   : "请选择人群类型"}
               </CardTitle>
               {expandedType && (
                 <div className="flex gap-2">
+                  <Button variant="outline" size="sm" onClick={handleAddPrompt}>
+                    <Plus className="w-4 h-4 mr-2" />
+                    新增词条
+                  </Button>
                   <Button
                     variant="destructive"
                     size="sm"
@@ -566,19 +569,6 @@ export default function PromptConfig() {
                   >
                     <Trash2 className="w-4 h-4 mr-2" />
                     清空当前类型
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => handleRegenerate(expandedType)}
-                    disabled={isGenerating}
-                  >
-                    {isGenerating ? (
-                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                    ) : (
-                      <RefreshCw className="w-4 h-4 mr-2" />
-                    )}
-                    AI重新生成
                   </Button>
                 </div>
               )}
@@ -603,9 +593,7 @@ export default function PromptConfig() {
                             {editingId === prompt.id ? (
                               <Input
                                 value={prompt.style_name}
-                                onChange={(e) =>
-                                  handleUpdatePrompt(prompt.id, "style_name", e.target.value)
-                                }
+                                onChange={(e) => handleUpdatePrompt(prompt.id, "style_name", e.target.value)}
                                 className="h-8 w-40"
                                 autoFocus
                                 onBlur={() => setEditingId(null)}
@@ -642,39 +630,28 @@ export default function PromptConfig() {
                           </div>
                         </div>
 
-                        {/* 正向提示词 */}
                         <div className="mb-2">
-                          <label className="text-xs text-muted-foreground mb-1 block">
-                            正向提示词 (Positive)
-                          </label>
+                          <label className="text-xs text-muted-foreground mb-1 block">正向提示词</label>
                           <Textarea
                             value={prompt.positive_prompt}
-                            onChange={(e) =>
-                              handleUpdatePrompt(prompt.id, "positive_prompt", e.target.value)
-                            }
-                            rows={3}
+                            onChange={(e) => handleUpdatePrompt(prompt.id, "positive_prompt", e.target.value)}
+                            rows={4}
                             className="resize-none text-sm"
                             placeholder="输入正向提示词..."
                           />
                         </div>
 
-                        {/* 负向提示词 */}
                         <div className="mb-2">
-                          <label className="text-xs text-muted-foreground mb-1 block">
-                            负向提示词 (Negative)
-                          </label>
+                          <label className="text-xs text-muted-foreground mb-1 block">负向提示词</label>
                           <Textarea
                             value={prompt.negative_prompt || ""}
-                            onChange={(e) =>
-                              handleUpdatePrompt(prompt.id, "negative_prompt", e.target.value)
-                            }
+                            onChange={(e) => handleUpdatePrompt(prompt.id, "negative_prompt", e.target.value)}
                             rows={2}
                             className="resize-none text-sm"
                             placeholder="输入负向提示词..."
                           />
                         </div>
 
-                        {/* 参考权重 & 引擎 */}
                         <div className="flex items-center gap-4 text-xs text-muted-foreground">
                           <span>参考权重: {prompt.reference_weight}</span>
                           <span>引擎: {prompt.preferred_engine || "默认"}</span>
@@ -686,39 +663,36 @@ export default function PromptConfig() {
                   {currentPrompts.length === 0 && (
                     <div className="text-center py-12">
                       <p className="text-muted-foreground mb-4">
-                        {batchId
-                          ? "暂无提示词，请点击「生成当前类型」或「AI重新生成」"
-                          : "暂无提示词（演示模式）"}
+                        当前类型暂无词库，请点击「新增词条」或「导入词库」
                       </p>
-                      {batchId && (
-                        <Button
-                          variant="outline"
-                          onClick={() => handleRegenerate(expandedType)}
-                          disabled={isGenerating}
-                        >
-                          <Sparkles className="w-4 h-4 mr-2" />
-                          为此类型生成提示词
+                      <div className="flex items-center justify-center gap-2">
+                        <Button variant="outline" onClick={handleAddPrompt}>
+                          <Plus className="w-4 h-4 mr-2" />
+                          新增词条
                         </Button>
-                      )}
+                        <Button variant="outline" onClick={handleImportClick}>
+                          <Upload className="w-4 h-4 mr-2" />
+                          导入词库
+                        </Button>
+                      </div>
                     </div>
                   )}
                 </div>
               </ScrollArea>
             ) : (
               <div className="flex items-center justify-center h-[calc(100vh-320px)]">
-                <p className="text-muted-foreground">请从左侧选择一个人群类型查看提示词</p>
+                <p className="text-muted-foreground">请从左侧选择一个人群类型查看词库</p>
               </div>
             )}
           </CardContent>
         </Card>
       </div>
 
-      {/* 生成进度浮层 */}
       {isGenerating && genProgress && (
         <div className="fixed bottom-6 right-6 w-80 bg-popover border rounded-lg shadow-lg p-4 z-50">
           <div className="flex items-center gap-2 mb-2">
             <Loader2 className="w-4 h-4 animate-spin" />
-            <span className="text-sm font-medium">提示词生成中...</span>
+            <span className="text-sm font-medium">任务创建中...</span>
           </div>
           <div className="w-full bg-muted rounded-full h-2 mb-2">
             <div

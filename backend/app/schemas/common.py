@@ -138,6 +138,35 @@ class PromptGenerateRequest(BaseModel):
         return _check_uuid(v, "reference_image_id")
 
 
+class PromptCreateRequest(BaseModel):
+    """新增或更新单条提示词"""
+    crowd_type: str = Field(..., min_length=3, max_length=10, description="人群类型ID，如 C02")
+    style_name: str = Field(..., min_length=1, max_length=255, description="风格名称")
+    positive_prompt: str = Field(..., min_length=1, max_length=20000, description="正向提示词")
+    negative_prompt: Optional[str] = Field("", max_length=20000, description="负向提示词")
+    reference_weight: int = Field(80, ge=0, le=100, description="参考权重")
+    preferred_engine: Optional[str] = Field("seedream", description="seedream/nanobanana")
+    is_active: bool = Field(True, description="是否启用")
+
+    @field_validator("crowd_type")
+    @classmethod
+    def _crowd_type(cls, v: str) -> str:
+        token = (v or "").strip().upper()
+        if token not in _VALID_CROWD_IDS:
+            raise ValueError(f"无效的人群类型: {v}")
+        return token
+
+    @field_validator("preferred_engine")
+    @classmethod
+    def _preferred_engine(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or not str(v).strip():
+            return "seedream"
+        token = str(v).strip().lower()
+        if token not in _VALID_ENGINES:
+            raise ValueError(f"preferred_engine 必须为 {_VALID_ENGINES} 之一")
+        return token
+
+
 class PromptResponse(BaseModel):
     """提示词响应"""
     batch_id: str

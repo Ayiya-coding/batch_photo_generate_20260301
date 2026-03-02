@@ -24,6 +24,8 @@ export const API = {
   // ===== 提示词 =====
   prompt: {
     generate: `${API_BASE}/prompt/generate`,
+    create: `${API_BASE}/prompt/create`,
+    import: `${API_BASE}/prompt/import`,
     progress: (batchId: string) => `${API_BASE}/prompt/progress/${batchId}`,
     cancel: (batchId: string) => `${API_BASE}/prompt/cancel/${batchId}`,
     list: `${API_BASE}/prompt/list`,
