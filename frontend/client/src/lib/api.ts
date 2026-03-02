@@ -253,7 +253,7 @@ export const promptApi = {
     crowdTypes?: string[],
     referenceImageId?: string,
     promptCount = 5,
-    strictReference = true,
+    strictReference = false,
   ) {
     return unwrapWithRetry<{ batch_id: string; crowd_types_count: number }>(() =>
       http.post(API.prompt.generate, {
@@ -330,7 +330,7 @@ export interface GenerateOverview {
 
 export const generateApi = {
   /** 启动批量生图 */
-  start(batchId: string, engine?: string, strictReference = true) {
+  start(batchId: string, engine?: string, strictReference = false) {
     return unwrapWithRetry<{ batch_id: string; pending_count: number; engine: string }>(() =>
       http.post(API.generate.start, { batch_id: batchId, engine, strict_reference: strictReference }),
     );
@@ -347,7 +347,7 @@ export const generateApi = {
   },
 
   /** 重试失败任务 */
-  retry(batchId: string, engine?: string, strictReference = true) {
+  retry(batchId: string, engine?: string, strictReference = false) {
     return unwrapWithRetry<{ retry_count: number }>(() =>
       http.post(API.generate.retry, { batch_id: batchId, engine, strict_reference: strictReference }),
     );

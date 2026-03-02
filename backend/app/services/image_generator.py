@@ -55,6 +55,42 @@ class APIYiImageClient:
         self.last_error_code = ""
         self.last_error_message = ""
 
+    @staticmethod
+    def _encode_reference_image(path: str, max_side: int = 1024, max_bytes: int = 450 * 1024) -> str:
+        """
+        读取并压缩参考图，避免上游 multipart 缓冲区溢出。
+        - 最长边限制为 max_side
+        - JPEG 质量逐级下降，尽量控制在 max_bytes 内
+        """
+        if not path or not Path(path).exists():
+            return ""
+        image = cv2.imread(path)
+        if image is None:
+            return ""
+
+        h, w = image.shape[:2]
+        long_side = max(h, w)
+        if long_side > max_side:
+            scale = max_side / float(long_side)
+            image = cv2.resize(
+                image,
+                (max(1, int(w * scale)), max(1, int(h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        chosen = None
+        for quality in (86, 78, 70, 62):
+            ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            if not ok:
+                continue
+            chosen = buf
+            if len(buf) <= max_bytes:
+                break
+
+        if chosen is None:
+            return ""
+        return base64.b64encode(chosen.tobytes()).decode("utf-8")
+
     def _reset_last_error(self):
         self.last_error_code = ""
         self.last_error_message = ""
@@ -142,12 +178,9 @@ class APIYiImageClient:
         }
 
         # 读取参考图片
-        ref_b64 = ""
-        if reference_image_path and Path(reference_image_path).exists():
-            image = cv2.imread(reference_image_path)
-            if image is not None:
-                _, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                ref_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
+        # change-photo 分支默认“可生成优先”：
+        # 仅在 strict_reference 打开时携带参考图，避免上游不兼容 image 字段导致整批失败。
+        ref_b64 = self._encode_reference_image(reference_image_path) if strict_reference else ""
 
         if strict_reference and not ref_b64:
             logger.error("严格参考模式缺少有效参考图: %s", reference_image_path or "<empty>")

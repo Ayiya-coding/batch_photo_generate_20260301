@@ -162,7 +162,8 @@ async def _async_generate_prompts(
             build_hot_outfit_styles,
         )
 
-        api_key = get_setting_value(db, "prompt_api_key", "")
+        # 先读系统设置，缺失时回退到 .env 的 BAILIAN_API_KEY
+        api_key = get_setting_value(db, "prompt_api_key", "") or settings.BAILIAN_API_KEY
         system_prompt = get_setting_value(db, "prompt_system_prompt", "")
         default_generate_engine = (
             get_setting_value(db, "generate_engine", settings.IMAGE_GENERATION_ENGINE)
@@ -399,6 +400,11 @@ async def _async_generate_prompts(
                             status="pending",
                         ))
                         tasks_created += 1
+                    else:
+                        # 兜底修复：上次中断可能遗留 processing 状态，重置为 pending 以便再次生图
+                        if existing_task.status == "processing":
+                            existing_task.status = "pending"
+                            existing_task.complete_time = None
 
             db.commit()
 

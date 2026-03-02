@@ -497,6 +497,21 @@ async def start_generation(request: GenerateRequest, db: Session = Depends(get_d
         return BaseResponse(code=1, message="该批次正在生图中")
     ps.clear_cancel(TASK_TYPE, request.batch_id)
 
+    # 兜底修复：若上次任务异常中断，可能残留 processing 状态，这里统一回滚为 pending
+    stuck_task_ids = [
+        row[0]
+        for row in db.query(GenerateTask.id).join(BaseImage).filter(
+            BaseImage.batch_id == request.batch_id,
+            GenerateTask.status == "processing",
+        ).all()
+    ]
+    if stuck_task_ids:
+        db.query(GenerateTask).filter(GenerateTask.id.in_(stuck_task_ids)).update(
+            {GenerateTask.status: "pending"},
+            synchronize_session=False,
+        )
+        db.commit()
+
     # 统计待生成任务
     pending = db.query(GenerateTask).join(BaseImage).filter(
         BaseImage.batch_id == request.batch_id,
