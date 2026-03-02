@@ -97,18 +97,25 @@ def _summarize_reference_image(image_path: str) -> str:
         return ""
 
 
-def _build_task_prompt(base_prompt: str, style_name: str) -> str:
+def _build_task_prompt(base_prompt: str, style_name: str, strict_reference: bool = True) -> str:
     """
     在模板提示词上追加“参考背景、替换人物”的硬约束，降低跑偏。
     """
     base = (base_prompt or "").strip()
-    guard = (
-        f"仅参考底图背景（景点、建筑、光影、机位与构图）生成，保持背景与地标关系稳定。"
-        f"人物按“{style_name}”穿搭重建，不沿用原图人脸身份。"
-        "优先强调服装、发型、配饰、姿态，不要过度强调脸部微细节。"
-        "脸部需清晰无遮挡，禁止口罩、墨镜、手挡脸、头发遮眼。"
-        "禁止更换背景地点、禁止改换地标建筑。"
-    )
+    if strict_reference:
+        guard = (
+            "严格参考上传图片：背景图、背景色彩、光影、地标、构图、机位全部保持不变。"
+            f"仅修改人物主体，按“{style_name}”重建穿搭与造型，不沿用原图人物身份与人脸。"
+            "优先强调服装、发型、配饰、姿态、景别和站位，不要长篇描写背景细节。"
+            "脸部需清晰无遮挡，禁止口罩、墨镜、手挡脸、头发遮眼。"
+        )
+    else:
+        guard = (
+            f"仅参考底图背景（景点、建筑、光影、机位与构图）生成，保持背景与地标关系稳定。"
+            f"人物按“{style_name}”穿搭重建，不沿用原图人脸身份。"
+            "优先强调服装、发型、配饰、姿态，不要过度强调脸部微细节。"
+            "脸部需清晰无遮挡，禁止口罩、墨镜、手挡脸、头发遮眼。"
+        )
     return f"{guard} {base}" if base else guard
 
 
@@ -117,7 +124,7 @@ def _build_task_negative_prompt(base_negative: str) -> str:
     强化负向约束：避免沿用底图原人物脸。
     """
     extra = (
-        "沿用原图人脸, 同一身份, 背景替换, 地标变更, 更换地点, 脸部遮挡, 墨镜, 口罩, 手挡脸, 头发遮眼, 过近脸部特写"
+        "沿用原图人脸, 同一身份, 背景替换, 背景重绘, 背景色调变化, 光影方向变化, 地标变更, 更换地点, 脸部遮挡, 墨镜, 口罩, 手挡脸, 头发遮眼, 过近脸部特写"
     )
     base = (base_negative or "").strip()
     return f"{base}, {extra}" if base else extra
@@ -127,12 +134,15 @@ def _run_prompt_gen_background(
     batch_id: str,
     crowd_type_ids: list,
     prompt_count: int,
+    strict_reference: bool,
     reference_image_id: str | None = None,
 ):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_async_generate_prompts(batch_id, crowd_type_ids, prompt_count, reference_image_id))
+        loop.run_until_complete(
+            _async_generate_prompts(batch_id, crowd_type_ids, prompt_count, strict_reference, reference_image_id)
+        )
     finally:
         loop.close()
 
@@ -141,6 +151,7 @@ async def _async_generate_prompts(
     batch_id: str,
     crowd_type_ids: list,
     prompt_count: int,
+    strict_reference: bool,
     reference_image_id: str | None = None,
 ):
     """异步批量生成提示词 — 分两阶段：1) 调API生成模板 2) 为所有底图创建任务"""
@@ -187,7 +198,11 @@ async def _async_generate_prompts(
 
         ref_path = ref_image.processed_path or ref_image.original_path
         raw_reference_context = _summarize_reference_image(ref_path)
-        reference_context = await generator.refine_reference_context(raw_reference_context)
+        if strict_reference:
+            # 严格参考模式下，不把背景细节写进提示词文本，避免“文生图式重建背景”
+            reference_context = ""
+        else:
+            reference_context = await generator.refine_reference_context(raw_reference_context)
         template_count = sum(len(v) for v in styles_by_crowd.values())
         task_count = len(base_images) * template_count
 
@@ -197,7 +212,7 @@ async def _async_generate_prompts(
             template_count,
             (
                 f"阶段1: 生成提示词模板 ({len(crowd_type_ids)} 类型 × 每类{prompt_count}条 = {template_count} 条) "
-                f"| 参考底图: {ref_image.filename}"
+                f"| 参考底图: {ref_image.filename} | 严格参考={'开启' if strict_reference else '关闭'}"
             ),
         )
         ps.append_log(TASK_TYPE, batch_id,
@@ -372,6 +387,7 @@ async def _async_generate_prompts(
                         task_prompt = _build_task_prompt(
                             tmpl.positive_prompt if tmpl else "",
                             style["name"],
+                            strict_reference=strict_reference,
                         )
                         db.add(GenerateTask(
                             base_image_id=img.id,
@@ -424,7 +440,13 @@ async def generate_prompts(request: PromptGenerateRequest, db: Session = Depends
 
     t = threading.Thread(
         target=_run_prompt_gen_background,
-        args=(request.batch_id, crowd_type_ids, request.prompt_count, request.reference_image_id),
+        args=(
+            request.batch_id,
+            crowd_type_ids,
+            request.prompt_count,
+            request.strict_reference,
+            request.reference_image_id,
+        ),
         daemon=True,
     )
     ps.clear_cancel(TASK_TYPE, request.batch_id)
@@ -434,6 +456,7 @@ async def generate_prompts(request: PromptGenerateRequest, db: Session = Depends
         "batch_id": request.batch_id,
         "crowd_types_count": len(crowd_type_ids),
         "prompt_count": request.prompt_count,
+        "strict_reference": request.strict_reference,
         "reference_image_id": request.reference_image_id or "",
     })
 

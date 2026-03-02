@@ -115,6 +115,7 @@ class APIYiImageClient:
         negative_prompt: str = "",
         reference_image_path: str = "",
         reference_weight: int = 80,
+        strict_reference: bool = True,
         output_path: str = "",
     ) -> bool:
         """
@@ -148,6 +149,11 @@ class APIYiImageClient:
                 _, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 90])
                 ref_b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
 
+        if strict_reference and not ref_b64:
+            logger.error("严格参考模式缺少有效参考图: %s", reference_image_path or "<empty>")
+            self._record_error(0, "missing_reference_image")
+            return False
+
         if engine == "seedream":
             ok = await self._generate_seedream(
                 headers, prompt, negative_prompt, ref_b64, reference_weight, output_path
@@ -158,17 +164,30 @@ class APIYiImageClient:
             # Seedream 渠道/配额异常时自动降级到 NanoBanana，避免整批任务 0 产出
             if self._can_fallback_from_seedream():
                 logger.warning(
-                    "Seedream 不可用（%s），自动降级到 %s",
+                    "Seedream 不可用（%s），自动降级到 %s（strict_reference=%s）",
                     self.last_error_code or "unknown",
                     self.nanobanana_model,
+                    strict_reference,
                 )
                 return await self._generate_nanobanana(
-                    headers, prompt, negative_prompt, ref_b64, reference_weight, output_path
+                    headers,
+                    prompt,
+                    negative_prompt,
+                    ref_b64,
+                    reference_weight,
+                    output_path,
+                    strict_reference=strict_reference,
                 )
             return False
         elif engine == "nanobanana":
             return await self._generate_nanobanana(
-                headers, prompt, negative_prompt, ref_b64, reference_weight, output_path
+                headers,
+                prompt,
+                negative_prompt,
+                ref_b64,
+                reference_weight,
+                output_path,
+                strict_reference=strict_reference,
             )
         else:
             raise ValueError(f"不支持的引擎: {engine}")
@@ -208,6 +227,7 @@ class APIYiImageClient:
     async def _generate_nanobanana(
         self, headers: dict, prompt: str, negative_prompt: str,
         ref_b64: str, ref_weight: int, output_path: str,
+        strict_reference: bool = True,
     ) -> bool:
         """Nano Banana Pro 生图（优先尝试带参考图，失败再自动回退文本生图）"""
         payload_base = {
@@ -226,6 +246,14 @@ class APIYiImageClient:
             self._apply_watermark_options(payload_with_ref)
             if await self._call_api(headers, payload_with_ref, output_path):
                 return True
+            if strict_reference:
+                logger.error(
+                    "NanoBanana 参考图模式失败，严格参考模式禁止回退纯文本生图 | code=%s",
+                    self.last_error_code or "unknown",
+                )
+                if not self.last_error_code:
+                    self._record_error(0, "reference_mode_failed")
+                return False
             logger.warning(
                 "NanoBanana 参考图模式失败，回退为纯文本生图 | code=%s",
                 self.last_error_code or "unknown",
@@ -402,6 +430,8 @@ class ConcurrentImageGenerator:
             "unauthorized": "API Key 无效或权限不足，请检查密钥配置。",
             "upstream_server_error": "上游服务异常，可稍后重试。",
             "request_error": "网络请求异常，请检查网络连通性。",
+            "missing_reference_image": "严格参考模式缺少有效参考图，请检查底图路径。",
+            "reference_mode_failed": "参考图编辑模式失败（严格参考下禁止回退纯文本）。",
             "strict_no_watermark_cleanup_failed": "严格无水印校验失败，生成结果被拦截。",
             "watermark_remover_unavailable": "去水印引擎不可用（Volc/IOPaint），请检查去水印配置。",
             "watermark_cleanup_exception": "去水印处理异常，请查看后端日志。",
@@ -453,6 +483,7 @@ class ConcurrentImageGenerator:
         reference_image_path: str,
         reference_weight: int,
         output_path: str,
+        strict_reference: bool = True,
     ) -> tuple[bool, str, list[str]]:
         """带重试的单图生成（返回详细失败原因）"""
         reason_messages: dict[str, str] = {}
@@ -472,6 +503,7 @@ class ConcurrentImageGenerator:
                     negative_prompt=negative_prompt,
                     reference_image_path=reference_image_path,
                     reference_weight=reference_weight,
+                    strict_reference=strict_reference,
                     output_path=output_path,
                 )
 
@@ -529,6 +561,7 @@ class ConcurrentImageGenerator:
         reference_image_path: str,
         reference_weight: int,
         output_path: str,
+        strict_reference: bool = True,
     ) -> bool:
         """
         兼容旧调用：仅返回成功/失败。
@@ -540,6 +573,7 @@ class ConcurrentImageGenerator:
             negative_prompt=negative_prompt,
             reference_image_path=reference_image_path,
             reference_weight=reference_weight,
+            strict_reference=strict_reference,
             output_path=output_path,
         )
         return ok

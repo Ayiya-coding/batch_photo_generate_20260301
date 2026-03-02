@@ -431,6 +431,31 @@ export default function Settings() {
             </div>
             <div className="flex items-center justify-between rounded-md border p-3">
               <div className="space-y-1">
+                <Label>严格参考模式</Label>
+                <p className="text-xs text-muted-foreground">
+                  开启后强制图生图参考上传底图，不允许回退到纯文本生图，背景/光影必须沿用底图
+                </p>
+              </div>
+              <Switch
+                checked={cv(settings, "generate_strict_reference", "1") === "1"}
+                onCheckedChange={(v) => set("generate_strict_reference", v ? "1" : "0")}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>参考图权重：{cv(settings, "generate_reference_weight", "95")}</Label>
+              <Slider
+                value={[Number(cv(settings, "generate_reference_weight", "95"))]}
+                onValueChange={([v]) => set("generate_reference_weight", String(v))}
+                min={70}
+                max={100}
+                step={1}
+              />
+              <p className="text-xs text-muted-foreground">
+                建议 90-98。数值越高，背景保持越强，人物改造自由度越小。
+              </p>
+            </div>
+            <div className="flex items-center justify-between rounded-md border p-3">
+              <div className="space-y-1">
                 <Label>关闭生图水印</Label>
                 <p className="text-xs text-muted-foreground">
                   开启后会向 SeedDream / Nano Banana 请求 `watermark=false` 及 `logo_info.add_logo=false`

@@ -217,6 +217,7 @@ export default function PromptConfig() {
       [expandedType],
       selectedImageId || undefined,
       normalizedPromptCount,
+      true,
     );
     if (!result) {
       setIsGenerating(false);
@@ -266,6 +267,7 @@ export default function PromptConfig() {
       [typeId],
       selectedImageId || undefined,
       normalizedPromptCount,
+      true,
     );
     if (!result) {
       setIsGenerating(false);

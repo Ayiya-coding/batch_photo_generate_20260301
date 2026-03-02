@@ -182,16 +182,16 @@ def _normalize_watermark_engine(engine_name: str) -> str:
     return "auto"
 
 
-def _run_generate_background(batch_id: str, engine: str):
+def _run_generate_background(batch_id: str, engine: str, strict_reference: bool):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(_async_batch_generate(batch_id, engine))
+        loop.run_until_complete(_async_batch_generate(batch_id, engine, strict_reference))
     finally:
         loop.close()
 
 
-async def _async_batch_generate(batch_id: str, engine: str):
+async def _async_batch_generate(batch_id: str, engine: str, strict_reference: bool):
     """异步批量生图核心逻辑"""
     db = SessionLocal()
     generator = None
@@ -207,6 +207,15 @@ async def _async_batch_generate(batch_id: str, engine: str):
         strict_no_watermark = (
             get_setting_value(db, "strict_no_watermark", "1").strip() != "0"
         )
+        strict_reference_setting = (
+            str(get_setting_value(db, "generate_strict_reference", "1")).strip() != "0"
+        )
+        strict_reference = bool(strict_reference and strict_reference_setting)
+        try:
+            reference_weight = int(str(get_setting_value(db, "generate_reference_weight", "95")).strip() or "95")
+        except ValueError:
+            reference_weight = 95
+        reference_weight = max(0, min(100, reference_weight))
         watermark_engine = _normalize_watermark_engine(
             get_setting_value(db, "watermark_engine", "auto")
         )
@@ -262,13 +271,13 @@ async def _async_batch_generate(batch_id: str, engine: str):
                 bg_reference_map[img_id] = src_ref
 
         ps.init(TASK_TYPE, batch_id, total,
-                f"开始批量生图: {total} 个任务, 引擎={engine}",
+                f"开始批量生图: {total} 个任务, 引擎={engine}, 严格参考={'开启' if strict_reference else '关闭'}",
                 per_image=per_image,
                 reason_stats=reason_stats)
         ps.append_log(
             TASK_TYPE,
             batch_id,
-            f"[REF] 已准备背景参考图 {len(bg_reference_map)} 张（锁景点/光影，弱化原人像）",
+            f"[REF] 已准备背景参考图 {len(bg_reference_map)} 张（锁景点/光影，弱化原人像）| reference_weight={reference_weight}",
         )
 
         generator = ConcurrentImageGenerator(
@@ -329,14 +338,20 @@ async def _async_batch_generate(batch_id: str, engine: str):
 
                     task_engine = engine or t.ai_engine or settings.IMAGE_GENERATION_ENGINE
 
-                    success, fail_detail, fail_codes = await generator.generate_single_with_retry_detail(
-                        engine=task_engine,
-                        prompt=t.prompt or "",
-                        negative_prompt=t.negative_prompt or "",
-                        reference_image_path=ref_bg_path,
-                        reference_weight=92,
-                        output_path=output_path,
-                    )
+                    if strict_reference and (not ref_bg_path or not Path(ref_bg_path).exists()):
+                        success = False
+                        fail_detail = "严格参考模式缺少有效参考图"
+                        fail_codes = ["missing_reference_image"]
+                    else:
+                        success, fail_detail, fail_codes = await generator.generate_single_with_retry_detail(
+                            engine=task_engine,
+                            prompt=t.prompt or "",
+                            negative_prompt=t.negative_prompt or "",
+                            reference_image_path=ref_bg_path,
+                            reference_weight=reference_weight,
+                            strict_reference=strict_reference,
+                            output_path=output_path,
+                        )
 
                     if success:
                         t.status = "completed"
@@ -496,10 +511,14 @@ async def start_generation(request: GenerateRequest, db: Session = Depends(get_d
         or get_setting_value(db, "generate_engine", settings.IMAGE_GENERATION_ENGINE)
         or settings.IMAGE_GENERATION_ENGINE
     )
+    strict_reference_setting = (
+        str(get_setting_value(db, "generate_strict_reference", "1")).strip() != "0"
+    )
+    strict_reference = bool(request.strict_reference and strict_reference_setting)
 
     t = threading.Thread(
         target=_run_generate_background,
-        args=(request.batch_id, engine),
+        args=(request.batch_id, engine, strict_reference),
         daemon=True,
     )
     t.start()
@@ -508,6 +527,7 @@ async def start_generation(request: GenerateRequest, db: Session = Depends(get_d
         "batch_id": request.batch_id,
         "pending_count": pending,
         "engine": engine,
+        "strict_reference": strict_reference,
     })
 
 
@@ -551,10 +571,14 @@ async def retry_failed(request: GenerateRequest, db: Session = Depends(get_db)):
         or get_setting_value(db, "generate_engine", settings.IMAGE_GENERATION_ENGINE)
         or settings.IMAGE_GENERATION_ENGINE
     )
+    strict_reference_setting = (
+        str(get_setting_value(db, "generate_strict_reference", "1")).strip() != "0"
+    )
+    strict_reference = bool(request.strict_reference and strict_reference_setting)
 
     t = threading.Thread(
         target=_run_generate_background,
-        args=(request.batch_id, engine),
+        args=(request.batch_id, engine, strict_reference),
         daemon=True,
     )
     ps.clear_cancel(TASK_TYPE, request.batch_id)
@@ -562,6 +586,7 @@ async def retry_failed(request: GenerateRequest, db: Session = Depends(get_db)):
 
     return BaseResponse(code=0, message=f"正在重试 {len(failed_tasks)} 个失败任务", data={
         "retry_count": len(failed_tasks),
+        "strict_reference": strict_reference,
     })
 
 
@@ -592,10 +617,18 @@ async def get_overview(batch_id: str, db: Session = Depends(get_db)):
         GenerateTask.status == "pending",
     ).scalar()
 
+    crowd_type_count = db.query(func.count(func.distinct(GenerateTask.crowd_type))).join(BaseImage).filter(
+        BaseImage.batch_id == batch_id,
+    ).scalar()
+
+    style_count = db.query(func.count(func.distinct(GenerateTask.style_name))).join(BaseImage).filter(
+        BaseImage.batch_id == batch_id,
+    ).scalar()
+
     return BaseResponse(code=0, data={
         "base_images": base_count,
-        "crowd_types": 19,
-        "styles_per_type": 5,
+        "crowd_types": crowd_type_count or 0,
+        "styles_per_type": style_count or 0,
         "total_tasks": total_tasks,
         "completed": completed_tasks,
         "failed": failed_tasks,

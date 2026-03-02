@@ -110,6 +110,7 @@ class PromptGenerateRequest(BaseModel):
     batch_id: str
     crowd_types: Optional[List[str]] = Field(None, description="指定人群类型，不指定则全部")
     prompt_count: int = Field(5, ge=1, le=20, description="本次生成提示词数量(N条)")
+    strict_reference: bool = Field(True, description="严格参考底图背景模式")
     reference_image_id: Optional[str] = Field(
         None,
         description="参考底图ID，用于基于底图特征生成提示词",
@@ -150,6 +151,7 @@ class GenerateRequest(BaseModel):
     """生图请求"""
     batch_id: str
     engine: Optional[str] = Field(None, description="AI引擎: seedream 或 nanobanana")
+    strict_reference: bool = Field(True, description="严格参考底图背景模式(禁用纯文生图回退)")
 
     @field_validator("batch_id")
     @classmethod

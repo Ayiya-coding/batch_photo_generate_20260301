@@ -248,13 +248,20 @@ export interface PromptItem {
 
 export const promptApi = {
   /** 一键生成提示词 */
-  generate(batchId: string, crowdTypes?: string[], referenceImageId?: string, promptCount = 5) {
+  generate(
+    batchId: string,
+    crowdTypes?: string[],
+    referenceImageId?: string,
+    promptCount = 5,
+    strictReference = true,
+  ) {
     return unwrapWithRetry<{ batch_id: string; crowd_types_count: number }>(() =>
       http.post(API.prompt.generate, {
         batch_id: batchId,
         crowd_types: crowdTypes,
         reference_image_id: referenceImageId,
         prompt_count: promptCount,
+        strict_reference: strictReference,
       }),
     );
   },
@@ -323,9 +330,9 @@ export interface GenerateOverview {
 
 export const generateApi = {
   /** 启动批量生图 */
-  start(batchId: string, engine?: string) {
+  start(batchId: string, engine?: string, strictReference = true) {
     return unwrapWithRetry<{ batch_id: string; pending_count: number; engine: string }>(() =>
-      http.post(API.generate.start, { batch_id: batchId, engine }),
+      http.post(API.generate.start, { batch_id: batchId, engine, strict_reference: strictReference }),
     );
   },
 
@@ -340,9 +347,9 @@ export const generateApi = {
   },
 
   /** 重试失败任务 */
-  retry(batchId: string, engine?: string) {
+  retry(batchId: string, engine?: string, strictReference = true) {
     return unwrapWithRetry<{ retry_count: number }>(() =>
-      http.post(API.generate.retry, { batch_id: batchId, engine }),
+      http.post(API.generate.retry, { batch_id: batchId, engine, strict_reference: strictReference }),
     );
   },
 

@@ -322,6 +322,7 @@ class PromptGenerator:
 输出规则：
 - 只输出“正向提示词 + 负向提示词”
 - 正向与负向之间用 "---NEGATIVE---" 分隔
+- 禁止长篇描写背景色彩/建筑细节，只写“背景严格沿用参考图”
 - 负向提示词简洁且强约束“禁止改背景地标与光影”"""
 
     async def refine_reference_context(self, raw_context: str) -> str:
@@ -382,28 +383,33 @@ class PromptGenerator:
         crowd_name = CROWD_TYPES.get(crowd_type_id, "未知")
         crowd_desc = CROWD_DESCRIPTIONS.get(crowd_type_id, "")
         crowd_fashion = _crowd_fashion_hint(crowd_type_id)
-        ref_block = f"\n参考底图特征：{reference_context}" if reference_context else ""
+        ref_block = "\n参考图约束：背景图、背景色彩、光影、地标、构图、机位全部严格沿用上传图，不重新设计背景。"
         variation_block = (
             f"\n造型变化方向：{style_variation_hint}"
             if style_variation_hint
-            else "\n造型变化方向：保持背景场景与机位稳定，人物身份与面部重建为目标人群，优先变化服装/发型/配饰/妆容，避免重复造型"
+            else "\n造型变化方向：仅变化人物服装/发型/配饰/姿态，人物身份重建，避免重复造型"
         )
         style_order_block = f"\n当前生成序号：第 {style_index}/{style_total} 条（要求与其他条明显不同）"
         crowd_fashion_block = f"\n年龄段穿搭约束：{crowd_fashion}"
+        reference_meta_block = (
+            f"\n底图分析标签（仅作约束，不要展开背景描写）：{reference_context}"
+            if reference_context
+            else ""
+        )
         return f"""请为以下组合生成一个图像生成提示词：
 
 人群类型：{crowd_name}（{crowd_desc}）
 风格：{style['name']}（{style['desc']}）
-{ref_block}{style_order_block}{variation_block}{crowd_fashion_block}
+{ref_block}{reference_meta_block}{style_order_block}{variation_block}{crowd_fashion_block}
 
 要求：
 - 输出中文正向提示词 + 负向提示词
 - 正向提示词和负向提示词用 "---NEGATIVE---" 分隔
 - 适合生成9:16比例的人物写真
 - 这是单人主体替换任务：保持背景不变，仅替换人物造型与穿搭
-- 明确要求“仅参考底图背景（景点/光影/景色），不要继承底图人物脸和身份，按目标人群重建人物”
-- 明确要求“背景建筑与地标关系保持稳定，不要改换成其他景点”
+- 明确要求“严格参考已上传图片背景，不要改背景颜色、光影、地标、建筑、构图”
 - 必须写清：服饰、发型、动作pose、景别、人物在背景中的位置
+- 强调“主写服装风格与人物造型，不要长篇描写背景细节”
 - 强调“优先写清服装/发型/配饰/姿态，不要过度强调面部细节，确保后续换脸可用（无遮挡脸部）”"""
 
     async def generate_single(

@@ -94,6 +94,8 @@ DEFAULT_SETTINGS = [
     ("generate_engine", "seedream", "图片生成引擎(seedream/nanobanana)"),
     ("apiyi_api_key", "", "API易平台统一API Key（SeedDream 4.5 + Nano Banana Pro）"),
     ("generate_model_version", "seedream-4-5-251128", "模型版本"),
+    ("generate_reference_weight", "95", "生图参考图权重(0-100)"),
+    ("generate_strict_reference", "1", "严格参考模式(1=开启，禁止回退纯文生图)"),
     ("disable_generation_watermark", "1", "关闭生图水印(1=关闭/0=保留)"),
     ("strict_no_watermark", "1", "强制无水印校验(1=开启，失败则整张判失败)"),
     ("generate_prompt_prefix", "", "默认提示词前缀"),
