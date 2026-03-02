@@ -17,6 +17,7 @@ import { Download, MoreHorizontal, Play, FileArchive, RefreshCw, AlertCircle, Lo
 import { cn } from "@/lib/utils";
 import JSZip from "jszip";
 import { compressApi, templateApi, toFileUrl, type TemplateItem } from "@/lib/api";
+import { useUpload } from "@/contexts/UploadContext";
 
 // 处理状态
 type ProcessStatus = "idle" | "processing" | "completed";
@@ -80,6 +81,7 @@ function mapTemplatesToImages(items: TemplateItem[]): ProcessImage[] {
 }
 
 export default function ImageProcess() {
+  const { batchId } = useUpload();
   const [images, setImages] = useState<ProcessImage[]>([]);
   const [processStatus, setProcessStatus] = useState<ProcessStatus>("idle");
   const [progress, setProgress] = useState(0);
@@ -90,9 +92,14 @@ export default function ImageProcess() {
 
   // ---------- Load templates ----------
   const loadTemplates = useCallback(async () => {
+    if (!batchId) {
+      setApiAvailable(false);
+      setImages([]);
+      return;
+    }
     setLoading(true);
     try {
-      const result = await templateApi.list({ final_status: "selected", page_size: 500 });
+      const result = await templateApi.list({ final_status: "selected", batch_id: batchId, page_size: 500 });
       if (result?.items?.length) {
         setApiAvailable(true);
         setImages(mapTemplatesToImages(result.items));
@@ -106,7 +113,7 @@ export default function ImageProcess() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [batchId]);
 
   useEffect(() => {
     loadTemplates();

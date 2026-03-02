@@ -23,7 +23,7 @@ from app.core.config import settings
 from app.core.settings_resolver import get_setting_value
 from app.core.constants import CROWD_TYPES, SINGLE_TYPES
 from app.schemas.common import PromptGenerateRequest, BaseResponse
-from app.models.database import BaseImage, PromptTemplate, GenerateTask
+from app.models.database import BaseImage, PromptTemplate, GenerateTask, TemplateImage
 from app.services import progress_store as ps
 
 logger = logging.getLogger(__name__)
@@ -162,14 +162,18 @@ async def _async_generate_prompts(
             build_hot_outfit_styles,
         )
 
-        # 先读系统设置，缺失时回退到 .env 的 BAILIAN_API_KEY
         api_key = get_setting_value(db, "prompt_api_key", "") or settings.BAILIAN_API_KEY
+        scene_api_key = get_setting_value(db, "apiyi_api_key", "") or settings.APIYI_API_KEY
         system_prompt = get_setting_value(db, "prompt_system_prompt", "")
         default_generate_engine = (
             get_setting_value(db, "generate_engine", settings.IMAGE_GENERATION_ENGINE)
             or settings.IMAGE_GENERATION_ENGINE
         )
-        generator = PromptGenerator(api_key=api_key, system_prompt=system_prompt)
+        generator = PromptGenerator(
+            api_key=api_key,
+            system_prompt=system_prompt,
+            scene_api_key=scene_api_key,
+        )
 
         base_images = db.query(BaseImage).filter(
             BaseImage.batch_id == batch_id,
@@ -179,11 +183,6 @@ async def _async_generate_prompts(
         if not base_images:
             ps.fail(TASK_TYPE, batch_id, "没有已完成预处理的底图")
             return
-
-        styles_by_crowd = {
-            ct_id: build_hot_outfit_styles(ct_id, prompt_count)
-            for ct_id in crowd_type_ids
-        }
 
         ref_image = None
         if reference_image_id:
@@ -199,11 +198,23 @@ async def _async_generate_prompts(
 
         ref_path = ref_image.processed_path or ref_image.original_path
         raw_reference_context = _summarize_reference_image(ref_path)
-        if strict_reference:
-            # 严格参考模式下，不把背景细节写进提示词文本，避免“文生图式重建背景”
-            reference_context = ""
-        else:
-            reference_context = await generator.refine_reference_context(raw_reference_context)
+        scene_reference_context = await generator.analyze_reference_scene(
+            ref_path,
+            fallback_context=raw_reference_context,
+        )
+        reference_context = (
+            scene_reference_context
+            if strict_reference
+            else await generator.refine_reference_context(scene_reference_context or raw_reference_context)
+        )
+        styles_by_crowd = {
+            ct_id: build_hot_outfit_styles(
+                ct_id,
+                prompt_count,
+                scene_hint=reference_context,
+            )
+            for ct_id in crowd_type_ids
+        }
         template_count = sum(len(v) for v in styles_by_crowd.values())
         task_count = len(base_images) * template_count
 
@@ -218,6 +229,8 @@ async def _async_generate_prompts(
         )
         ps.append_log(TASK_TYPE, batch_id,
                       f"阶段2: 为 {len(base_images)} 张底图创建生成任务 (共 {task_count} 个)")
+        if reference_context:
+            ps.append_log(TASK_TYPE, batch_id, f"[场景锚点] {reference_context}")
 
         # ===== 阶段1: 调用百炼API生成提示词模板 =====
         completed_count = 0
@@ -356,6 +369,27 @@ async def _async_generate_prompts(
                 f"[CLEANUP] 已清理非当前配置的遗留任务 {len(stale_task_ids)} 条",
             )
 
+        # 清理当前批次历史任务与模板图，避免旧轮次结果混入新一轮测试
+        batch_task_ids = [
+            row[0]
+            for row in db.query(GenerateTask.id).join(BaseImage).filter(
+                BaseImage.batch_id == batch_id,
+            ).all()
+        ]
+        if batch_task_ids:
+            deleted_templates = db.query(TemplateImage).filter(
+                TemplateImage.generate_task_id.in_(batch_task_ids)
+            ).delete(synchronize_session=False)
+            deleted_tasks = db.query(GenerateTask).filter(
+                GenerateTask.id.in_(batch_task_ids)
+            ).delete(synchronize_session=False)
+            db.commit()
+            ps.append_log(
+                TASK_TYPE,
+                batch_id,
+                f"[CLEANUP] 已清理当前批次历史任务 {deleted_tasks} 条，模板图 {deleted_templates} 张",
+            )
+
         templates = db.query(PromptTemplate).filter(
             PromptTemplate.crowd_type.in_(crowd_type_ids),
             PromptTemplate.is_active == True,
@@ -401,7 +435,7 @@ async def _async_generate_prompts(
                         ))
                         tasks_created += 1
                     else:
-                        # 兜底修复：上次中断可能遗留 processing 状态，重置为 pending 以便再次生图
+                        # 上次任务中断可能留下 processing 状态，这里统一回滚到 pending
                         if existing_task.status == "processing":
                             existing_task.status = "pending"
                             existing_task.complete_time = None

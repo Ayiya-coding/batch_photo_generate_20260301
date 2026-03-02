@@ -293,6 +293,7 @@ async def replace_template(
 @router.get("/list", response_model=BaseResponse)
 async def list_templates(
     crowd_type: Optional[str] = Query(None),
+    batch_id: Optional[str] = Query(None, description="按批次筛选（可选）"),
     final_status: Optional[str] = Query("selected", description="selected/pending_modification/trash"),
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1, le=500),
@@ -303,6 +304,12 @@ async def list_templates(
 
     if crowd_type:
         query = query.filter(TemplateImage.crowd_type == crowd_type)
+    if batch_id:
+        query = (
+            query.join(GenerateTask, TemplateImage.generate_task_id == GenerateTask.id)
+            .join(BaseImage, GenerateTask.base_image_id == BaseImage.id)
+            .filter(BaseImage.batch_id == batch_id)
+        )
     if final_status:
         query = query.filter(TemplateImage.final_status == final_status)
 
@@ -417,10 +424,17 @@ async def delete_template(template_id: str, db: Session = Depends(get_db)):
 @router.get("/stats", response_model=BaseResponse)
 async def template_stats(
     crowd_type: Optional[str] = Query(None),
+    batch_id: Optional[str] = Query(None, description="按批次筛选（可选）"),
     db: Session = Depends(get_db),
 ):
     """获取模板图统计数据"""
     base_query = db.query(TemplateImage)
+    if batch_id:
+        base_query = (
+            base_query.join(GenerateTask, TemplateImage.generate_task_id == GenerateTask.id)
+            .join(BaseImage, GenerateTask.base_image_id == BaseImage.id)
+            .filter(BaseImage.batch_id == batch_id)
+        )
     if crowd_type:
         base_query = base_query.filter(TemplateImage.crowd_type == crowd_type)
 
@@ -432,7 +446,14 @@ async def template_stats(
     # 按人群类型分组统计（仅选用库）
     crowd_stats = {}
     for ct_id, ct_name in CROWD_TYPES.items():
-        count = db.query(TemplateImage).filter(
+        per_ct_query = db.query(TemplateImage)
+        if batch_id:
+            per_ct_query = (
+                per_ct_query.join(GenerateTask, TemplateImage.generate_task_id == GenerateTask.id)
+                .join(BaseImage, GenerateTask.base_image_id == BaseImage.id)
+                .filter(BaseImage.batch_id == batch_id)
+            )
+        count = per_ct_query.filter(
             TemplateImage.crowd_type == ct_id,
             TemplateImage.final_status == "selected",
         ).count()

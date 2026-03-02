@@ -7,11 +7,14 @@
 - 背景仅作为景点/光影参考，不作为风格类别
 """
 import asyncio
+import base64
 import logging
+import re
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import httpx
+import cv2
 
 from app.core.config import settings
 from app.core.constants import CROWD_TYPES
@@ -20,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 # 阿里百炼 OpenAI 兼容端点
 BAILIAN_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+APIYI_CHAT_ENDPOINT = "https://api.apiyi.com/v1/chat/completions"
 
 SEASONAL_TREND_HINTS = {
     "spring": "春季：轻薄叠穿、柔和色彩、透气面料",
@@ -170,6 +174,11 @@ PAIR_STYLE_PRESETS: Dict[str, List[Dict[str, str]]] = {
 
 
 DEFAULT_STYLES = STYLE_PRESETS["C02"]
+UNIFIED_NEGATIVE_PROMPT = (
+    "背景替换, 改变地标建筑, 改变背景色调, 改变光影方向, 更换机位构图, 多人物, "
+    "保留原图人物身份, 沿用原图人脸, 遮挡脸部, 口罩, 墨镜, 手挡脸, 头发遮眼, "
+    "肢体畸形, 多手多脚, 低清晰度, 模糊, 文字, 水印, logo, 边框, 噪点, 过曝"
+)
 
 
 def get_styles_for_crowd(crowd_type_id: str) -> List[Dict[str, str]]:
@@ -178,23 +187,41 @@ def get_styles_for_crowd(crowd_type_id: str) -> List[Dict[str, str]]:
     return PAIR_STYLE_PRESETS.get(crowd_type_id, DEFAULT_STYLES)
 
 
-def build_hot_outfit_styles(crowd_type_id: str, prompt_count: int) -> List[Dict[str, str]]:
+def build_hot_outfit_styles(
+    crowd_type_id: str,
+    prompt_count: int,
+    scene_hint: str = "",
+) -> List[Dict[str, str]]:
     """
-    基于单个人群类型动态生成 N 条“热门穿搭”占位风格。
-    注意：这里不预设具体穿搭池，真正穿搭细节由大模型结合底图背景/光影生成。
+    基于人群类型 + 场景线索生成 N 条可读的穿搭风格名称（不再使用“热门穿搭01/02”占位名）。
     """
     count = max(1, min(int(prompt_count or 5), 20))
     crowd_name = CROWD_TYPES.get(crowd_type_id, crowd_type_id)
+    scene = (scene_hint or "").strip()
+    scene_short = re.sub(r"\s+", " ", scene)[:56]
+
+    base_styles = get_styles_for_crowd(crowd_type_id)
+    if not base_styles:
+        base_styles = DEFAULT_STYLES
+
     styles: List[Dict[str, str]] = []
-    for idx in range(1, count + 1):
-        styles.append({
-            "name": f"热门穿搭{idx:02d}",
-            "desc": f"基于底图背景与光影，为{crowd_name}推荐当下热门穿搭造型",
-            "variation": (
-                f"第{idx}/{count}条：与其他条明显区分，必须同时变化服饰、发型、pose、"
-                "景别与人物站位，但背景地标和光影保持一致"
-            ),
-        })
+    for idx in range(count):
+        tpl = base_styles[idx % len(base_styles)]
+        round_idx = idx // len(base_styles) + 1
+        style_name = tpl["name"] if round_idx == 1 else f"{tpl['name']}·变体{round_idx}"
+        style_desc = tpl["desc"]
+        if scene_short:
+            style_desc = f"{style_desc}；需适配该场景打卡氛围"
+        styles.append(
+            {
+                "name": style_name,
+                "desc": style_desc,
+                "variation": (
+                    f"第{idx + 1}/{count}条：保持底图地标/光影/构图不变，"
+                    "仅变化人物服饰、发型、pose、景别、站位"
+                ),
+            }
+        )
     return styles
 
 
@@ -298,8 +325,9 @@ CROWD_DESCRIPTIONS = {
 class PromptGenerator:
     """提示词生成器 - 调用阿里百炼 API"""
 
-    def __init__(self, api_key: str = "", system_prompt: str = ""):
+    def __init__(self, api_key: str = "", system_prompt: str = "", scene_api_key: str = ""):
         self.api_key = api_key or settings.BAILIAN_API_KEY
+        self.scene_api_key = scene_api_key or settings.APIYI_API_KEY
         self.system_prompt = system_prompt or settings.PROMPT_SYSTEM_PROMPT or self._default_system_prompt()
         self.model = "qwen-plus"
         self.timeout = 60.0
@@ -324,6 +352,91 @@ class PromptGenerator:
 - 正向与负向之间用 "---NEGATIVE---" 分隔
 - 禁止长篇描写背景色彩/建筑细节，只写“背景严格沿用参考图”
 - 负向提示词简洁且强约束“禁止改背景地标与光影”"""
+
+    @staticmethod
+    def _encode_scene_image(image_path: str, max_side: int = 640) -> str:
+        """压缩参考图用于视觉理解，降低 token 与请求体体积。"""
+        if not image_path:
+            return ""
+        image = cv2.imread(image_path)
+        if image is None:
+            return ""
+        h, w = image.shape[:2]
+        long_side = max(h, w)
+        if long_side > max_side:
+            scale = max_side / float(long_side)
+            image = cv2.resize(
+                image,
+                (max(1, int(w * scale)), max(1, int(h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 62])
+        if not ok:
+            return ""
+        return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+    async def analyze_reference_scene(self, image_path: str, fallback_context: str = "") -> str:
+        """
+        视觉识别底图，返回“场景锚点”短文本：
+        包含景点/地标线索、光影、时间氛围、构图与机位关键词。
+        """
+        fallback = (fallback_context or "").strip()
+        if not self.scene_api_key:
+            return fallback
+
+        img_b64 = self._encode_scene_image(image_path)
+        if not img_b64:
+            return fallback
+
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是写真场景识别助手。根据参考图输出一段简短中文场景锚点，"
+                        "只描述可见事实，不臆造。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "请输出1段 40~90 字中文：包含“场景类型/疑似地标/光影方向/时间氛围/构图机位”。"
+                                "只输出一句，不要分点。"
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                        },
+                    ],
+                },
+            ],
+            "temperature": 0.2,
+            "max_tokens": 180,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.scene_api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(APIYI_CHAT_ENDPOINT, json=payload, headers=headers)
+            if resp.status_code != 200:
+                logger.warning("底图视觉识别失败，回退基础特征: HTTP %s", resp.status_code)
+                return fallback
+            data = resp.json()
+            text = data["choices"][0]["message"]["content"].strip()
+            text = re.sub(r"\s+", " ", text)
+            if len(text) > 120:
+                text = text[:120]
+            return text or fallback
+        except Exception as e:
+            logger.warning("底图视觉识别异常，回退基础特征: %s", e)
+            return fallback
 
     async def refine_reference_context(self, raw_context: str) -> str:
         """
@@ -392,7 +505,7 @@ class PromptGenerator:
         style_order_block = f"\n当前生成序号：第 {style_index}/{style_total} 条（要求与其他条明显不同）"
         crowd_fashion_block = f"\n年龄段穿搭约束：{crowd_fashion}"
         reference_meta_block = (
-            f"\n底图分析标签（仅作约束，不要展开背景描写）：{reference_context}"
+            f"\n底图场景识别锚点（必须保留，不可改背景）：{reference_context}"
             if reference_context
             else ""
         )
@@ -411,6 +524,46 @@ class PromptGenerator:
 - 必须写清：服饰、发型、动作pose、景别、人物在背景中的位置
 - 强调“主写服装风格与人物造型，不要长篇描写背景细节”
 - 强调“优先写清服装/发型/配饰/姿态，不要过度强调面部细节，确保后续换脸可用（无遮挡脸部）”"""
+
+    @staticmethod
+    def _sanitize_positive_prompt(text: str, reference_context: str = "") -> str:
+        """
+        收敛提示词重心到“服装/发型/姿态”，并避免继承底图原人物信息。
+        """
+        prompt = (text or "").strip()
+        prompt = re.sub(r"^\s*正向提示词[:：]?\s*", "", prompt, flags=re.IGNORECASE)
+        prompt = re.sub(r"\s+", " ", prompt)
+
+        # 删除“原图中某女性/某人物”这类身份继承描述
+        prompt = re.sub(r"与原图中[^，。；;]{0,30}(女性|男性|人物)[^，。；;]{0,30}", "与参考图人物站位一致", prompt)
+        prompt = re.sub(r"原图中[^，。；;]{0,30}(女性|男性|人物)", "参考图人物", prompt)
+
+        # 背景描述统一成短句，避免喧宾夺主
+        prompt = re.sub(
+            r"(严格参考已上传图片背景[^，。；;]{0,80})",
+            "背景严格沿用参考图（地标/光影/构图不变）",
+            prompt,
+        )
+        if "背景严格沿用参考图" not in prompt:
+            anchor = f"（{reference_context}）" if reference_context else ""
+            prompt = f"{prompt}；背景严格沿用参考图{anchor}，仅替换人物穿搭与造型。"
+        return prompt.strip(" ;；")
+
+    @staticmethod
+    def _fallback_positive_prompt(
+        crowd_type_id: str,
+        style: Dict[str, str],
+        reference_context: str = "",
+    ) -> str:
+        crowd_name = CROWD_TYPES.get(crowd_type_id, crowd_type_id)
+        crowd_desc = CROWD_DESCRIPTIONS.get(crowd_type_id, "")
+        anchor = reference_context or "参考图地标与光影"
+        return (
+            f"9:16竖构图，背景严格沿用参考图（{anchor}，地标/光影/机位不变）；"
+            f"主体为{crowd_name}（{crowd_desc}），穿搭采用“{style.get('name', '热门穿搭')}”：{style.get('desc', '')}；"
+            "发型与服装协调，脸部清晰无遮挡；动作pose自然打卡；景别以中近景或中景为主；"
+            "人物位于参考图原主体附近站位，仅替换人物造型与服装，不改背景。"
+        )
 
     async def generate_single(
         self,
@@ -460,7 +613,10 @@ class PromptGenerator:
             if resp.status_code != 200:
                 error_msg = resp.text[:300]
                 logger.error(f"百炼 API 错误: HTTP {resp.status_code} - {error_msg}")
-                raise RuntimeError(f"百炼 API 调用失败: HTTP {resp.status_code}")
+                return (
+                    self._fallback_positive_prompt(crowd_type_id, style, reference_context),
+                    UNIFIED_NEGATIVE_PROMPT,
+                )
 
             data = resp.json()
             content = data["choices"][0]["message"]["content"].strip()
@@ -483,13 +639,12 @@ class PromptGenerator:
                     negative = parts[1].strip()
                     break
 
-            if not negative:
-                negative = (
-                    "低清晰度、模糊、畸形手、肢体异常、五官错位、背景错景、地标错位、"
-                    "保留原人脸、遮挡脸部、口罩、墨镜、水印、文字、噪点、过曝"
-                )
+            positive = self._sanitize_positive_prompt(positive, reference_context)
+            if len(positive) < 36:
+                positive = self._fallback_positive_prompt(crowd_type_id, style, reference_context)
 
-            return positive, negative
+            # 负向提示词统一，避免不同风格出现冲突约束
+            return positive, UNIFIED_NEGATIVE_PROMPT
 
     async def generate_batch(
         self,

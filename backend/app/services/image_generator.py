@@ -56,11 +56,9 @@ class APIYiImageClient:
         self.last_error_message = ""
 
     @staticmethod
-    def _encode_reference_image(path: str, max_side: int = 1024, max_bytes: int = 450 * 1024) -> str:
+    def _encode_reference_image(path: str, max_side: int = 896, max_bytes: int = 220 * 1024) -> str:
         """
-        读取并压缩参考图，避免上游 multipart 缓冲区溢出。
-        - 最长边限制为 max_side
-        - JPEG 质量逐级下降，尽量控制在 max_bytes 内
+        读取并压缩参考图，避免请求体过大导致上游解析失败。
         """
         if not path or not Path(path).exists():
             return ""
@@ -78,18 +76,35 @@ class APIYiImageClient:
                 interpolation=cv2.INTER_AREA,
             )
 
-        chosen = None
+        selected = None
         for quality in (86, 78, 70, 62):
             ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
             if not ok:
                 continue
-            chosen = buf
+            selected = buf
             if len(buf) <= max_bytes:
                 break
-
-        if chosen is None:
+        if selected is None:
             return ""
-        return base64.b64encode(chosen.tobytes()).decode("utf-8")
+        return base64.b64encode(selected.tobytes()).decode("utf-8")
+
+    @classmethod
+    def _encode_reference_variants(cls, path: str) -> list[str]:
+        """
+        生成多级压缩版本，遇到上游 invalid_image_request / buffer full 时自动降级重试。
+        """
+        specs = [
+            (960, 260 * 1024),
+            (768, 170 * 1024),
+            (640, 110 * 1024),
+            (512, 72 * 1024),
+        ]
+        variants: list[str] = []
+        for max_side, max_bytes in specs:
+            b64 = cls._encode_reference_image(path, max_side=max_side, max_bytes=max_bytes)
+            if b64 and b64 not in variants:
+                variants.append(b64)
+        return variants
 
     def _reset_last_error(self):
         self.last_error_code = ""
@@ -105,6 +120,12 @@ class APIYiImageClient:
             or "余额不足" in message
         ):
             self.last_error_code = "insufficient_user_quota"
+        elif (
+            "invalid_image_request" in text
+            or "multipart: nextpart" in text
+            or "bufio: buffer full" in text
+        ):
+            self.last_error_code = "invalid_image_request"
         elif "无可用渠道" in message or "no available channel" in text:
             self.last_error_code = "no_available_channel"
         elif status_code == 401:
@@ -125,6 +146,7 @@ class APIYiImageClient:
             "rate_limited",
             "upstream_server_error",
             "request_error",
+            "invalid_image_request",
         }
 
     def _apply_watermark_options(self, payload: dict):
@@ -177,22 +199,33 @@ class APIYiImageClient:
             "Content-Type": "application/json",
         }
 
-        # 读取参考图片
-        # change-photo 分支默认“可生成优先”：
-        # 仅在 strict_reference 打开时携带参考图，避免上游不兼容 image 字段导致整批失败。
-        ref_b64 = self._encode_reference_image(reference_image_path) if strict_reference else ""
+        # 读取参考图片（多级压缩版本，兼容上游请求体限制）
+        ref_variants = self._encode_reference_variants(reference_image_path) if reference_image_path else []
+        if not ref_variants:
+            ref_variants = [""]
 
-        if strict_reference and not ref_b64:
+        if strict_reference and not ref_variants[0]:
             logger.error("严格参考模式缺少有效参考图: %s", reference_image_path or "<empty>")
             self._record_error(0, "missing_reference_image")
             return False
 
         if engine == "seedream":
-            ok = await self._generate_seedream(
-                headers, prompt, negative_prompt, ref_b64, reference_weight, output_path
-            )
-            if ok:
-                return True
+            # 先用 Seedream 逐级尝试参考图尺寸
+            for idx, ref_b64 in enumerate(ref_variants, start=1):
+                ok = await self._generate_seedream(
+                    headers, prompt, negative_prompt, ref_b64, reference_weight, output_path
+                )
+                if ok:
+                    return True
+
+                if ref_b64 and self.last_error_code == "invalid_image_request" and idx < len(ref_variants):
+                    logger.warning(
+                        "Seedream 参考图请求过大，降级重试第 %s/%s 档压缩图",
+                        idx + 1,
+                        len(ref_variants),
+                    )
+                    continue
+                break
 
             # Seedream 渠道/配额异常时自动降级到 NanoBanana，避免整批任务 0 产出
             if self._can_fallback_from_seedream():
@@ -202,7 +235,30 @@ class APIYiImageClient:
                     self.nanobanana_model,
                     strict_reference,
                 )
-                return await self._generate_nanobanana(
+                for idx, ref_b64 in enumerate(ref_variants, start=1):
+                    ok = await self._generate_nanobanana(
+                        headers,
+                        prompt,
+                        negative_prompt,
+                        ref_b64,
+                        reference_weight,
+                        output_path,
+                        strict_reference=strict_reference,
+                    )
+                    if ok:
+                        return True
+                    if ref_b64 and self.last_error_code == "invalid_image_request" and idx < len(ref_variants):
+                        logger.warning(
+                            "NanoBanana 参考图请求过大，降级重试第 %s/%s 档压缩图",
+                            idx + 1,
+                            len(ref_variants),
+                        )
+                        continue
+                    break
+            return False
+        elif engine == "nanobanana":
+            for idx, ref_b64 in enumerate(ref_variants, start=1):
+                ok = await self._generate_nanobanana(
                     headers,
                     prompt,
                     negative_prompt,
@@ -211,17 +267,17 @@ class APIYiImageClient:
                     output_path,
                     strict_reference=strict_reference,
                 )
+                if ok:
+                    return True
+                if ref_b64 and self.last_error_code == "invalid_image_request" and idx < len(ref_variants):
+                    logger.warning(
+                        "NanoBanana 参考图请求过大，降级重试第 %s/%s 档压缩图",
+                        idx + 1,
+                        len(ref_variants),
+                    )
+                    continue
+                break
             return False
-        elif engine == "nanobanana":
-            return await self._generate_nanobanana(
-                headers,
-                prompt,
-                negative_prompt,
-                ref_b64,
-                reference_weight,
-                output_path,
-                strict_reference=strict_reference,
-            )
         else:
             raise ValueError(f"不支持的引擎: {engine}")
 
@@ -229,7 +285,7 @@ class APIYiImageClient:
         self, headers: dict, prompt: str, negative_prompt: str,
         ref_b64: str, ref_weight: int, output_path: str,
     ) -> bool:
-        """Seedream 生图（OpenAI-compatible 参数）"""
+        """Seedream 生图（文本生成 / 参考图编辑双模式）"""
         models = [self.seedream_model, "seedream-4-5-251128", "seedream-4.5"]
         tried = set()
 
@@ -241,16 +297,22 @@ class APIYiImageClient:
             payload = {
                 "model": model,
                 "prompt": prompt,
-                "negative_prompt": negative_prompt,
                 "size": self.seedream_size,
-                "n": 1,
             }
-            self._apply_watermark_options(payload)
+            if negative_prompt:
+                payload["negative_prompt"] = negative_prompt
 
-            # Seedream 支持 data URI 参考图（测试可用）
+            # 关键修复：API易图生图需走 input.image 协议，不能用顶层 image/reference_strength。
             if ref_b64:
-                payload["image"] = f"data:image/jpeg;base64,{ref_b64}"
-                payload["reference_strength"] = round(max(0, min(100, ref_weight)) / 100.0, 2)
+                payload["input"] = {
+                    "image": ref_b64,
+                    "function": "edit",
+                }
+                payload["parameters"] = {"n": 1}
+            else:
+                payload["n"] = 1
+
+            self._apply_watermark_options(payload)
 
             if await self._call_api(headers, payload, output_path):
                 return True
@@ -262,20 +324,23 @@ class APIYiImageClient:
         ref_b64: str, ref_weight: int, output_path: str,
         strict_reference: bool = True,
     ) -> bool:
-        """Nano Banana Pro 生图（优先尝试带参考图，失败再自动回退文本生图）"""
+        """Nano Banana Pro 生图（优先参考图编辑，失败再按 strict 决定是否回退文本）"""
         payload_base = {
             "model": self.nanobanana_model,
             "prompt": prompt,
-            "negative_prompt": negative_prompt,
             "size": self.nanobanana_size,
-            "n": 1,
         }
+        if negative_prompt:
+            payload_base["negative_prompt"] = negative_prompt
 
         # 1) 先尝试“参考图+文本”模式，提升人物一致性和编辑可控性
         if ref_b64:
             payload_with_ref = dict(payload_base)
-            payload_with_ref["image"] = f"data:image/jpeg;base64,{ref_b64}"
-            payload_with_ref["reference_strength"] = round(max(0, min(100, ref_weight)) / 100.0, 2)
+            payload_with_ref["input"] = {
+                "image": ref_b64,
+                "function": "edit",
+            }
+            payload_with_ref["parameters"] = {"n": 1}
             self._apply_watermark_options(payload_with_ref)
             if await self._call_api(headers, payload_with_ref, output_path):
                 return True
@@ -294,6 +359,7 @@ class APIYiImageClient:
 
         # 2) 回退为文本生图
         payload = dict(payload_base)
+        payload["n"] = 1
         self._apply_watermark_options(payload)
         return await self._call_api(headers, payload, output_path)
 
@@ -465,6 +531,7 @@ class ConcurrentImageGenerator:
             "request_error": "网络请求异常，请检查网络连通性。",
             "missing_reference_image": "严格参考模式缺少有效参考图，请检查底图路径。",
             "reference_mode_failed": "参考图编辑模式失败（严格参考下禁止回退纯文本）。",
+            "invalid_image_request": "参考图请求无效（可能请求体过大/格式不兼容），系统已自动降级压缩重试。",
             "strict_no_watermark_cleanup_failed": "严格无水印校验失败，生成结果被拦截。",
             "watermark_remover_unavailable": "去水印引擎不可用（Volc/IOPaint），请检查去水印配置。",
             "watermark_cleanup_exception": "去水印处理异常，请查看后端日志。",

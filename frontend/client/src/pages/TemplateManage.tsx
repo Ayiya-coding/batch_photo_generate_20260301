@@ -24,6 +24,7 @@ import { Download, MoreHorizontal, Eye, Edit, Trash2, Upload, RefreshCw, FileArc
 import { cn } from "@/lib/utils";
 import JSZip from "jszip";
 import { templateApi, toFileUrl, type TemplateItem } from "@/lib/api";
+import { useUpload } from "@/contexts/UploadContext";
 
 type ViewType = "approved" | "needEdit" | "recycled";
 
@@ -133,6 +134,7 @@ function realId(id: string): string {
 }
 
 export default function TemplateManage() {
+  const { batchId } = useUpload();
   const [templates, setTemplates] = useState<TemplateImage[]>([]);
   const [loading, setLoading] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
@@ -153,6 +155,7 @@ export default function TemplateManage() {
     try {
       const result = await templateApi.list({
         final_status: STATUS_MAP[currentView],
+        batch_id: batchId || undefined,
         page_size: 200,
       });
       if (result?.items && result.items.length > 0) {
@@ -165,7 +168,7 @@ export default function TemplateManage() {
     } finally {
       setLoading(false);
     }
-  }, [currentView]);
+  }, [currentView, batchId]);
 
   useEffect(() => {
     loadTemplates();

@@ -53,11 +53,16 @@ export default function WideFace() {
 
   // ---- 加载模板数据 ----
   useEffect(() => {
+    if (!batchId) {
+      setImages([]);
+      setLoading(false);
+      return;
+    }
     let cancelled = false;
     (async () => {
       setLoading(true);
       try {
-        const result = await templateApi.list({ final_status: "selected", page_size: 500 });
+        const result = await templateApi.list({ final_status: "selected", batch_id: batchId, page_size: 500 });
         if (cancelled) return;
         if (result?.items && result.items.length > 0) {
           const filtered = result.items.filter((t) =>
@@ -77,7 +82,7 @@ export default function WideFace() {
       if (!cancelled) setLoading(false);
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [batchId]);
 
   // ---- 轮询宽脸图状态 ----
   const stopPolling = () => {
@@ -89,8 +94,12 @@ export default function WideFace() {
 
   /** 从后端刷新模板列表，更新图片状态 */
   const refreshTemplates = async () => {
+    if (!batchId) {
+      setImages([]);
+      return;
+    }
     try {
-      const result = await templateApi.list({ final_status: "selected", page_size: 500 });
+      const result = await templateApi.list({ final_status: "selected", batch_id: batchId, page_size: 500 });
       if (!result?.items) return;
       const filtered = result.items.filter((t) =>
         SINGLE_CROWD_TYPE_IDS.includes(t.crowd_type as (typeof SINGLE_CROWD_TYPE_IDS)[number]),

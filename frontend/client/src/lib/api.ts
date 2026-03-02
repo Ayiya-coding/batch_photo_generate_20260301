@@ -253,7 +253,7 @@ export const promptApi = {
     crowdTypes?: string[],
     referenceImageId?: string,
     promptCount = 5,
-    strictReference = false,
+    strictReference = true,
   ) {
     return unwrapWithRetry<{ batch_id: string; crowd_types_count: number }>(() =>
       http.post(API.prompt.generate, {
@@ -330,7 +330,7 @@ export interface GenerateOverview {
 
 export const generateApi = {
   /** 启动批量生图 */
-  start(batchId: string, engine?: string, strictReference = false) {
+  start(batchId: string, engine?: string, strictReference = true) {
     return unwrapWithRetry<{ batch_id: string; pending_count: number; engine: string }>(() =>
       http.post(API.generate.start, { batch_id: batchId, engine, strict_reference: strictReference }),
     );
@@ -347,7 +347,7 @@ export const generateApi = {
   },
 
   /** 重试失败任务 */
-  retry(batchId: string, engine?: string, strictReference = false) {
+  retry(batchId: string, engine?: string, strictReference = true) {
     return unwrapWithRetry<{ retry_count: number }>(() =>
       http.post(API.generate.retry, { batch_id: batchId, engine, strict_reference: strictReference }),
     );
@@ -454,6 +454,7 @@ export const templateApi = {
   /** 获取模板列表 */
   list(params?: {
     crowd_type?: string;
+    batch_id?: string;
     final_status?: string;
     page?: number;
     page_size?: number;
@@ -505,9 +506,9 @@ export const templateApi = {
   },
 
   /** 统计数据 */
-  stats(crowdType?: string) {
+  stats(crowdType?: string, batchId?: string) {
     return unwrap<TemplateStats>(
-      http.get(API.template.stats, { params: { crowd_type: crowdType } }),
+      http.get(API.template.stats, { params: { crowd_type: crowdType, batch_id: batchId } }),
     );
   },
 

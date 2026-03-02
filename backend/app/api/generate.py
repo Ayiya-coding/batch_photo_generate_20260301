@@ -38,6 +38,8 @@ BG_REF_DIR = settings.PROCESSED_DIR / "background_refs"
 BG_REF_DIR.mkdir(parents=True, exist_ok=True)
 
 _FACE_CASCADE = None
+STRICT_BG_SIMILARITY_THRESHOLD = 0.18
+STRICT_BG_ORB_MIN_MATCHES = 4
 
 
 def _load_face_cascade():
@@ -92,32 +94,38 @@ def _build_subject_mask(image) -> Optional["np.ndarray"]:
     if face:
         x, y, fw, fh = face
         cx = x + fw // 2
-        top = max(0, y - int(fh * 0.9))
-        bottom = min(h, y + int(fh * 5.8))
-        half_w = int(fw * 1.9)
-        left = max(0, cx - half_w)
-        right = min(w, cx + half_w)
+        top = max(0, y - int(fh * 0.45))
+        shoulder_y = min(h - 1, y + int(fh * 1.55))
+        waist_y = min(h - 1, y + int(fh * 3.15))
+        bottom = min(h - 1, y + int(fh * 5.2))
+
+        head_half = max(16, int(fw * 0.72))
+        shoulder_half = max(22, int(fw * 1.25))
+        waist_half = max(26, int(fw * 1.45))
+        bottom_half = max(30, int(fw * 1.55))
+
+        poly = np.array(
+            [
+                [max(0, cx - head_half), top],
+                [min(w - 1, cx + head_half), top],
+                [min(w - 1, cx + shoulder_half), shoulder_y],
+                [min(w - 1, cx + waist_half), waist_y],
+                [min(w - 1, cx + bottom_half), bottom],
+                [max(0, cx - bottom_half), bottom],
+                [max(0, cx - waist_half), waist_y],
+                [max(0, cx - shoulder_half), shoulder_y],
+            ],
+            dtype=np.int32,
+        )
+        cv2.fillPoly(mask, [poly], 255)
     else:
-        # 无法稳定检测人脸时，按人像图常见主体区间兜底
-        top = int(h * 0.18)
-        bottom = h
-        left = int(w * 0.18)
-        right = int(w * 0.82)
-    cv2.rectangle(mask, (left, top), (right, bottom), 255, -1)
-    # 头肩区域做额外覆盖，防止原脸残留
-    head_cx = (left + right) // 2
-    head_cy = top + int((bottom - top) * 0.22)
-    cv2.ellipse(
-        mask,
-        (head_cx, head_cy),
-        (max(24, (right - left) // 3), max(20, (bottom - top) // 5)),
-        0,
-        0,
-        360,
-        255,
-        -1,
-    )
-    kernel = np.ones((25, 25), np.uint8)
+        # 无法稳定检测人脸时，使用较保守的人像主体椭圆兜底（避免覆盖过大导致背景条纹）
+        cx = w // 2
+        cy = int(h * 0.62)
+        axes = (max(22, int(w * 0.18)), max(40, int(h * 0.31)))
+        cv2.ellipse(mask, (cx, cy), axes, 0, 0, 360, 255, -1)
+
+    kernel = np.ones((11, 11), np.uint8)
     mask = cv2.dilate(mask, kernel, iterations=1)
     return mask
 
@@ -134,7 +142,7 @@ def _render_background_reference(source_path: str, image_id: str) -> str:
     if cv2 is None or np is None:
         return source_path
 
-    out_path = BG_REF_DIR / f"{image_id}_bgref.jpg"
+    out_path = BG_REF_DIR / f"{image_id}_bgref_v2.jpg"
     try:
         if out_path.exists() and out_path.stat().st_mtime >= src.stat().st_mtime:
             return str(out_path)
@@ -151,16 +159,24 @@ def _render_background_reference(source_path: str, image_id: str) -> str:
 
     try:
         mask_ratio = float((mask > 0).mean())
-        # 面积过大时优先模糊，避免大面积 inpaint 伪影；面积适中时 inpaint + 模糊混合
-        blurred = cv2.GaussianBlur(image, (61, 61), 0)
-        if mask_ratio <= 0.35:
-            inpainted = cv2.inpaint(image, mask, 7, cv2.INPAINT_TELEA)
-            mixed = cv2.addWeighted(inpainted, 0.72, blurred, 0.28, 0)
+        if mask_ratio > 0.46:
+            # 极端情况下先缩小遮罩，避免大面积抹除导致“条纹拉扯”伪影
+            shrink_kernel = np.ones((17, 17), np.uint8)
+            work_mask = cv2.erode(mask, shrink_kernel, iterations=1)
         else:
-            mixed = blurred
+            work_mask = mask
 
-        result = image.copy()
-        result[mask > 0] = mixed[mask > 0]
+        inpaint_radius = 5 if mask_ratio <= 0.30 else 4
+        inpainted = cv2.inpaint(image, work_mask, inpaint_radius, cv2.INPAINT_TELEA)
+
+        # 软边融合，避免修补边界硬切
+        feather = cv2.GaussianBlur(work_mask, (0, 0), sigmaX=6, sigmaY=6).astype(np.float32) / 255.0
+        feather3 = np.clip(feather[..., None], 0.0, 1.0)
+        result = (
+            inpainted.astype(np.float32) * feather3
+            + image.astype(np.float32) * (1.0 - feather3)
+        ).astype(np.uint8)
+
         out_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(out_path), result, [cv2.IMWRITE_JPEG_QUALITY, 92])
         return str(out_path)
@@ -180,6 +196,107 @@ def _normalize_watermark_engine(engine_name: str) -> str:
     if engine in ("auto", "iopaint", "volc", "opencv"):
         return engine
     return "auto"
+
+
+def _center_crop_to_ratio(image, target_ratio: float = 9.0 / 16.0):
+    h, w = image.shape[:2]
+    if h <= 1 or w <= 1:
+        return image
+    ratio = w / float(h)
+    if ratio > target_ratio:
+        new_w = int(h * target_ratio)
+        x0 = max(0, (w - new_w) // 2)
+        return image[:, x0:x0 + new_w]
+    new_h = int(w / target_ratio)
+    y0 = max(0, (h - new_h) // 2)
+    return image[y0:y0 + new_h, :]
+
+
+def _background_similarity_score(reference_path: str, generated_path: str) -> float:
+    """
+    计算参考图与生成图的背景相似度（0~1）：
+    综合颜色分布、边缘结构和全局相关性，用于严格参考模式的兜底校验。
+    """
+    if cv2 is None or np is None:
+        return 1.0
+    try:
+        ref = cv2.imread(reference_path)
+        gen = cv2.imread(generated_path)
+        if ref is None or gen is None:
+            return 0.0
+
+        ref = _center_crop_to_ratio(ref, 9.0 / 16.0)
+        gen = _center_crop_to_ratio(gen, 9.0 / 16.0)
+        ref = cv2.resize(ref, (288, 512), interpolation=cv2.INTER_AREA)
+        gen = cv2.resize(gen, (288, 512), interpolation=cv2.INTER_AREA)
+
+        ref_blur = cv2.GaussianBlur(ref, (9, 9), 0)
+        gen_blur = cv2.GaussianBlur(gen, (9, 9), 0)
+
+        ref_hsv = cv2.cvtColor(ref_blur, cv2.COLOR_BGR2HSV)
+        gen_hsv = cv2.cvtColor(gen_blur, cv2.COLOR_BGR2HSV)
+        hist_ref = cv2.calcHist([ref_hsv], [0, 1, 2], None, [8, 8, 8], [0, 180, 0, 256, 0, 256])
+        hist_gen = cv2.calcHist([gen_hsv], [0, 1, 2], None, [8, 8, 8], [0, 180, 0, 256, 0, 256])
+        cv2.normalize(hist_ref, hist_ref, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
+        cv2.normalize(hist_gen, hist_gen, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
+        hist_corr = float(cv2.compareHist(hist_ref, hist_gen, cv2.HISTCMP_CORREL))
+        hist_score = max(0.0, min(1.0, (hist_corr + 1.0) * 0.5))
+
+        ref_gray = cv2.cvtColor(ref_blur, cv2.COLOR_BGR2GRAY)
+        gen_gray = cv2.cvtColor(gen_blur, cv2.COLOR_BGR2GRAY)
+        ref_edge = cv2.Canny(ref_gray, 80, 160)
+        gen_edge = cv2.Canny(gen_gray, 80, 160)
+        kernel = np.ones((3, 3), np.uint8)
+        ref_edge = cv2.dilate(ref_edge, kernel, iterations=1)
+        gen_edge = cv2.dilate(gen_edge, kernel, iterations=1)
+        inter = float(np.logical_and(ref_edge > 0, gen_edge > 0).sum())
+        union = float(np.logical_or(ref_edge > 0, gen_edge > 0).sum())
+        edge_score = (inter / union) if union > 0 else 0.0
+
+        g1 = ref_gray.astype(np.float32).reshape(-1)
+        g2 = gen_gray.astype(np.float32).reshape(-1)
+        denom = float(np.linalg.norm(g1) * np.linalg.norm(g2))
+        corr = float(np.dot(g1, g2) / denom) if denom > 1e-6 else 0.0
+        corr_score = max(0.0, min(1.0, (corr + 1.0) * 0.5))
+
+        score = 0.45 * hist_score + 0.35 * edge_score + 0.20 * corr_score
+        return float(max(0.0, min(1.0, score)))
+    except Exception as e:
+        logger.warning("背景相似度计算失败: %s", e)
+        return 0.0
+
+
+def _background_similarity_metrics(reference_path: str, generated_path: str) -> tuple[float, int]:
+    if cv2 is None or np is None:
+        return 1.0, 999
+    score = _background_similarity_score(reference_path, generated_path)
+    try:
+        ref = cv2.imread(reference_path, cv2.IMREAD_GRAYSCALE)
+        gen = cv2.imread(generated_path, cv2.IMREAD_GRAYSCALE)
+        if ref is None or gen is None:
+            return score, 0
+        ref = _center_crop_to_ratio(ref, 9.0 / 16.0)
+        gen = _center_crop_to_ratio(gen, 9.0 / 16.0)
+        ref = cv2.resize(ref, (320, 568), interpolation=cv2.INTER_AREA)
+        gen = cv2.resize(gen, (320, 568), interpolation=cv2.INTER_AREA)
+        orb = cv2.ORB_create(900)
+        kp1, des1 = orb.detectAndCompute(ref, None)
+        kp2, des2 = orb.detectAndCompute(gen, None)
+        if des1 is None or des2 is None:
+            return score, 0
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        knn = matcher.knnMatch(des1, des2, k=2)
+        good = 0
+        for pair in knn:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < 0.75 * n.distance:
+                good += 1
+        return score, int(good)
+    except Exception as e:
+        logger.warning("背景特征匹配计算失败: %s", e)
+        return score, 0
 
 
 def _run_generate_background(batch_id: str, engine: str, strict_reference: bool):
@@ -261,12 +378,16 @@ async def _async_batch_generate(batch_id: str, engine: str, strict_reference: bo
         reason_stats: dict[str, int] = {}
         quota_alerted = False
 
-        # 为每张底图预生成“背景参考图”，弱化人像，锁定景点/光影/构图
+        # 严格参考模式直接使用原底图作为图生图参考，确保景点/光影强绑定；
+        # 非严格模式下再使用背景参考图以弱化原人像影响。
         bg_reference_map: dict[str, str] = {}
         for img_id, info in image_task_map.items():
             src_ref = (info.get("ref_path") or "").strip()
             if src_ref:
-                bg_reference_map[img_id] = _render_background_reference(src_ref, img_id)
+                if strict_reference:
+                    bg_reference_map[img_id] = src_ref
+                else:
+                    bg_reference_map[img_id] = _render_background_reference(src_ref, img_id)
             else:
                 bg_reference_map[img_id] = src_ref
 
@@ -277,7 +398,11 @@ async def _async_batch_generate(batch_id: str, engine: str, strict_reference: bo
         ps.append_log(
             TASK_TYPE,
             batch_id,
-            f"[REF] 已准备背景参考图 {len(bg_reference_map)} 张（锁景点/光影，弱化原人像）| reference_weight={reference_weight}",
+            (
+                f"[REF] 严格参考模式：使用原底图 {len(bg_reference_map)} 张（背景/光影强绑定）| reference_weight={reference_weight}"
+                if strict_reference
+                else f"[REF] 已准备背景参考图 {len(bg_reference_map)} 张（锁景点/光影，弱化原人像）| reference_weight={reference_weight}"
+            ),
         )
 
         generator = ConcurrentImageGenerator(
@@ -337,6 +462,10 @@ async def _async_batch_generate(batch_id: str, engine: str, strict_reference: bo
                     output_path = str(settings.GENERATED_DIR / output_filename)
 
                     task_engine = engine or t.ai_engine or settings.IMAGE_GENERATION_ENGINE
+                    strict_prompt_prefix = (
+                        "严格保留上传图原背景（地标建筑、光影方向、背景色彩、构图机位完全不变），"
+                        "只替换人物穿搭/发型/姿态；"
+                    )
 
                     if strict_reference and (not ref_bg_path or not Path(ref_bg_path).exists()):
                         success = False
@@ -353,8 +482,63 @@ async def _async_batch_generate(batch_id: str, engine: str, strict_reference: bo
                             output_path=output_path,
                         )
 
+                        # 严格参考模式下做一次背景相似度兜底，避免“生成图与底图场景无关”
+                        if success and strict_reference:
+                            bg_score, bg_matches = _background_similarity_metrics(ref_path, output_path)
+                            if (
+                                bg_score < STRICT_BG_SIMILARITY_THRESHOLD
+                                or bg_matches < STRICT_BG_ORB_MIN_MATCHES
+                            ):
+                                alt_engine = "nanobanana" if task_engine != "nanobanana" else "seedream"
+                                retry_prompt = f"{strict_prompt_prefix}{t.prompt or ''}"
+                                logger.warning(
+                                    (
+                                        "背景相似度偏低，触发严格参考重试 | task=%s | "
+                                        "score=%.3f | orb_matches=%s | engine=%s -> %s"
+                                    ),
+                                    task_id[:8],
+                                    bg_score,
+                                    bg_matches,
+                                    task_engine,
+                                    alt_engine,
+                                )
+                                retry_ok, retry_detail, retry_codes = await generator.generate_single_with_retry_detail(
+                                    engine=alt_engine,
+                                    prompt=retry_prompt,
+                                    negative_prompt=t.negative_prompt or "",
+                                    reference_image_path=ref_bg_path,
+                                    reference_weight=reference_weight,
+                                    strict_reference=True,
+                                    output_path=output_path,
+                                )
+                                if retry_ok:
+                                    retry_score, retry_matches = _background_similarity_metrics(ref_path, output_path)
+                                    if (
+                                        retry_score >= STRICT_BG_SIMILARITY_THRESHOLD
+                                        and retry_matches >= STRICT_BG_ORB_MIN_MATCHES
+                                    ):
+                                        success = True
+                                        task_engine = alt_engine
+                                        fail_detail = ""
+                                        fail_codes = []
+                                    else:
+                                        success = False
+                                        fail_detail = (
+                                            "background_mismatch: 背景相似度不足"
+                                            f"（score={retry_score:.3f}, orb_matches={retry_matches}）"
+                                        )
+                                        fail_codes = ["background_mismatch"]
+                                else:
+                                    success = False
+                                    fail_detail = retry_detail or (
+                                        "background_mismatch: 背景相似度不足"
+                                        f"（score={bg_score:.3f}, orb_matches={bg_matches}）"
+                                    )
+                                    fail_codes = retry_codes or ["background_mismatch"]
+
                     if success:
                         t.status = "completed"
+                        t.ai_engine = task_engine
                         t.result_path = output_path
                         t.complete_time = datetime.utcnow()
                         t.review_status = "pending_review"
@@ -497,7 +681,7 @@ async def start_generation(request: GenerateRequest, db: Session = Depends(get_d
         return BaseResponse(code=1, message="该批次正在生图中")
     ps.clear_cancel(TASK_TYPE, request.batch_id)
 
-    # 兜底修复：若上次任务异常中断，可能残留 processing 状态，这里统一回滚为 pending
+    # 兜底：若上次异常中断，可能遗留 processing 任务，先回滚为 pending
     stuck_task_ids = [
         row[0]
         for row in db.query(GenerateTask.id).join(BaseImage).filter(

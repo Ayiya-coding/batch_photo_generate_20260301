@@ -108,8 +108,7 @@ class Settings(BaseSettings):
     EXPORT_DIR: Path = DATA_DIR / "exports"
 
     class Config:
-        # 优先读取项目根目录 .env（与 start_local.sh 行为一致）
-        # 兼容从 backend/ 目录启动时读取不到根目录配置的问题
+        # 优先读取项目根目录 .env，兼容从 backend/ 目录启动
         env_file = str(BASE_DIR.parent / ".env")
         case_sensitive = True
         extra = "ignore"
