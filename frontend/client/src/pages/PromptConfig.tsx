@@ -5,6 +5,14 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { toast } from "sonner";
 import {
   Wand2,
@@ -19,6 +27,8 @@ import {
   Plus,
   Upload,
   Download,
+  Search,
+  ClipboardPaste,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useUpload } from "@/contexts/UploadContext";
@@ -26,6 +36,7 @@ import {
   uploadApi,
   promptApi,
   toFileUrl,
+  type PromptBulkItemPayload,
   type PromptItem,
   type ProgressInfo,
 } from "@/lib/api";
@@ -72,6 +83,131 @@ function groupByCrowdType(prompts: PromptItem[]): Record<string, PromptItem[]> {
   return map;
 }
 
+type ParsedBulkResult = {
+  items: PromptBulkItemPayload[];
+  errors: string[];
+};
+
+function parseBulkText(text: string, stylePrefix: string): ParsedBulkResult {
+  const content = text.replace(/\r\n/g, "\n").trim();
+  if (!content) {
+    return { items: [], errors: ["请输入要粘贴的提示词内容"] };
+  }
+
+  // 1) 优先解析 JSON 数组
+  try {
+    const parsed = JSON.parse(content);
+    if (Array.isArray(parsed)) {
+      const items: PromptBulkItemPayload[] = [];
+      for (let i = 0; i < parsed.length; i++) {
+        const row = parsed[i];
+        if (!row || typeof row !== "object") continue;
+        const styleName = String((row as Record<string, unknown>).style_name || `模板${String(i + 1).padStart(2, "0")}`).trim();
+        const positive = String((row as Record<string, unknown>).positive_prompt || "").trim();
+        const negative = String((row as Record<string, unknown>).negative_prompt || "").trim();
+        if (!positive) continue;
+        items.push({
+          style_name: styleName,
+          positive_prompt: positive,
+          negative_prompt: negative,
+          reference_weight: 90,
+          preferred_engine: "seedream",
+          is_active: true,
+        });
+      }
+      if (items.length > 0) return { items, errors: [] };
+    }
+  } catch {
+    // not json
+  }
+
+  const lines = content.split("\n").map((x) => x.trim()).filter(Boolean);
+  const errors: string[] = [];
+
+  // 2) 表格行：模板名<TAB>正向<TAB>负向 或 模板名|正向|负向
+  const tableSep = lines.some((line) => line.includes("\t")) ? "\t" : (lines.some((line) => line.includes("|")) ? "|" : "");
+  if (tableSep) {
+    const items: PromptBulkItemPayload[] = [];
+    const dataLines = lines.filter((line, idx) => {
+      if (idx !== 0) return true;
+      const header = line.toLowerCase();
+      return !(header.includes("style") || header.includes("模板") || header.includes("positive"));
+    });
+    for (let i = 0; i < dataLines.length; i++) {
+      const cols = dataLines[i].split(tableSep).map((x) => x.trim());
+      if (cols.length < 2) {
+        errors.push(`第 ${i + 1} 行列数不足，至少需要“模板名 + 正向提示词”`);
+        continue;
+      }
+      const styleName = cols[0] || `${stylePrefix}${String(i + 1).padStart(2, "0")}`;
+      const positive = cols[1] || "";
+      const negative = cols[2] || "";
+      if (!positive) {
+        errors.push(`第 ${i + 1} 行正向提示词为空`);
+        continue;
+      }
+      items.push({
+        style_name: styleName,
+        positive_prompt: positive,
+        negative_prompt: negative,
+        reference_weight: 90,
+        preferred_engine: "seedream",
+        is_active: true,
+      });
+    }
+    return { items, errors };
+  }
+
+  // 3) 分块格式：每块 1~3 行（模板名/正向/负向），块之间用 ---
+  if (content.includes("\n---")) {
+    const blocks = content.split(/\n---+\n/g).map((blk) => blk.trim()).filter(Boolean);
+    const items: PromptBulkItemPayload[] = [];
+    blocks.forEach((blk, idx) => {
+      const blkLines = blk.split("\n").map((x) => x.trim()).filter(Boolean);
+      if (blkLines.length === 0) return;
+      const styleName = blkLines[0] || `${stylePrefix}${String(idx + 1).padStart(2, "0")}`;
+      let positive = "";
+      let negative = "";
+      for (const ln of blkLines.slice(1)) {
+        const lower = ln.toLowerCase();
+        if (lower.startsWith("正向:") || lower.startsWith("positive:")) {
+          positive = ln.replace(/^正向:|^positive:/i, "").trim();
+        } else if (lower.startsWith("负向:") || lower.startsWith("negative:")) {
+          negative = ln.replace(/^负向:|^negative:/i, "").trim();
+        } else if (!positive) {
+          positive = ln;
+        } else if (!negative) {
+          negative = ln;
+        }
+      }
+      if (!positive) {
+        errors.push(`第 ${idx + 1} 块缺少正向提示词`);
+        return;
+      }
+      items.push({
+        style_name: styleName,
+        positive_prompt: positive,
+        negative_prompt: negative,
+        reference_weight: 90,
+        preferred_engine: "seedream",
+        is_active: true,
+      });
+    });
+    return { items, errors };
+  }
+
+  // 4) 最简格式：每行一条正向提示词，模板名自动生成
+  const fallbackItems = lines.map((line, idx) => ({
+    style_name: `${stylePrefix}${String(idx + 1).padStart(2, "0")}`,
+    positive_prompt: line,
+    negative_prompt: "",
+    reference_weight: 90,
+    preferred_engine: "seedream" as const,
+    is_active: true,
+  }));
+  return { items: fallbackItems, errors };
+}
+
 export default function PromptConfig() {
   const { batchId } = useUpload();
 
@@ -82,10 +218,15 @@ export default function PromptConfig() {
   const [expandedType, setExpandedType] = useState<string | null>("C02");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [promptCount, setPromptCount] = useState(5);
+  const [filterKeyword, setFilterKeyword] = useState("");
 
   const [isGenerating, setIsGenerating] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
+  const [isBulkSubmitting, setIsBulkSubmitting] = useState(false);
   const [genProgress, setGenProgress] = useState<ProgressInfo | null>(null);
+  const [bulkDialogOpen, setBulkDialogOpen] = useState(false);
+  const [bulkText, setBulkText] = useState("");
+  const [bulkReplaceCurrent, setBulkReplaceCurrent] = useState(false);
 
   const [loadingImages, setLoadingImages] = useState(false);
   const [loadingPrompts, setLoadingPrompts] = useState(false);
@@ -386,6 +527,65 @@ export default function PromptConfig() {
 
   const getTypePromptCount = (typeId: string) => promptMap[typeId]?.length || 0;
   const currentPrompts = expandedType ? (promptMap[expandedType] || []) : [];
+  const currentTypeName = allTypes.find((t) => t.id === expandedType)?.name || "模板";
+  const filteredPrompts = currentPrompts.filter((prompt) => {
+    const keyword = filterKeyword.trim().toLowerCase();
+    if (!keyword) return true;
+    return (
+      prompt.style_name.toLowerCase().includes(keyword)
+      || prompt.positive_prompt.toLowerCase().includes(keyword)
+      || (prompt.negative_prompt || "").toLowerCase().includes(keyword)
+    );
+  });
+  const bulkPreview = parseBulkText(bulkText, `${currentTypeName}模板`);
+
+  const handleOpenBulkDialog = useCallback(() => {
+    if (!expandedType) {
+      toast.info("请先选择人群类型");
+      return;
+    }
+    setBulkDialogOpen(true);
+    if (!bulkText.trim()) {
+      const typeName = allTypes.find((t) => t.id === expandedType)?.name || "人物";
+      setBulkText(
+        `模板一\t保持原图背景和光影不变，仅替换${typeName}人物；服装：新中式套装；发型：简洁盘发；姿态：自然站立；景别：半身；站位：右侧三分之一\t背景替换,地标变更,多人物,脸部遮挡\n模板二\t保持原图背景和光影不变，仅替换${typeName}人物；服装：都市轻通勤；发型：低马尾；姿态：扶栏轻倚；景别：全身；站位：前景偏左\t背景替换,地标变更,多人物,脸部遮挡`
+      );
+    }
+  }, [expandedType, bulkText]);
+
+  const handleFillBulkExample = useCallback(() => {
+    if (!expandedType) return;
+    const typeName = allTypes.find((t) => t.id === expandedType)?.name || "人物";
+    setBulkText(
+      `模板一\t严格参考原图背景和光影，仅替换${typeName}主体；服饰：新中式国风套装（刺绣上衣+半裙），发型：低盘发，动作：轻扶栏杆看向镜头，景别：半身，站位：右侧三分之一\t背景替换,地标变更,多人,遮挡脸\n模板二\t严格参考原图背景和光影，仅替换${typeName}主体；服饰：都市通勤西装（短外套+直筒裤），发型：低马尾，动作：自然前行抬手打招呼，景别：全身，站位：前景偏左\t背景替换,地标变更,多人,遮挡脸\n模板三\t严格参考原图背景和光影，仅替换${typeName}主体；服饰：轻礼服连衣裙，发型：微卷披发，动作：回眸微笑，景别：中景，站位：画面中央偏右\t背景替换,地标变更,多人,遮挡脸`
+    );
+    toast.info("已填入参考示例，可直接改写后导入");
+  }, [expandedType]);
+
+  const handleBulkSubmit = useCallback(async () => {
+    if (!expandedType) {
+      toast.info("请先选择人群类型");
+      return;
+    }
+    const typeName = allTypes.find((t) => t.id === expandedType)?.name || "模板";
+    const parsed = parseBulkText(bulkText, `${typeName}模板`);
+    if (parsed.items.length === 0) {
+      toast.error(parsed.errors[0] || "未识别到可导入的内容");
+      return;
+    }
+    if (parsed.errors.length > 0) {
+      toast.warning(`解析时有 ${parsed.errors.length} 条告警，系统将导入可识别条目`);
+    }
+
+    setIsBulkSubmitting(true);
+    const result = await promptApi.bulkUpsert(expandedType, parsed.items, bulkReplaceCurrent);
+    setIsBulkSubmitting(false);
+    if (result) {
+      toast.success(`批量写入完成：新增 ${result.created_count}，更新 ${result.updated_count}`);
+      setBulkDialogOpen(false);
+      await loadPrompts();
+    }
+  }, [expandedType, bulkText, bulkReplaceCurrent, loadPrompts]);
 
   return (
     <MainLayout
@@ -405,6 +605,10 @@ export default function PromptConfig() {
           <Button variant="outline" size="sm" onClick={handleDownloadTemplate}>
             <Download className="w-4 h-4 mr-2" />
             下载模板
+          </Button>
+          <Button variant="outline" size="sm" onClick={handleOpenBulkDialog}>
+            <ClipboardPaste className="w-4 h-4 mr-2" />
+            批量粘贴
           </Button>
           <Button variant="outline" size="sm" onClick={handleImportClick} disabled={isImporting}>
             {isImporting ? (
@@ -580,9 +784,22 @@ export default function PromptConfig() {
                 <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
               </div>
             ) : expandedType ? (
-              <ScrollArea className="h-full">
-                <div className="space-y-4 pr-4">
-                  {currentPrompts.map((prompt, index) => (
+              <div className="h-full flex flex-col">
+                <div className="flex items-center gap-2 pb-3 pr-4">
+                  <Search className="w-4 h-4 text-muted-foreground" />
+                  <Input
+                    value={filterKeyword}
+                    onChange={(e) => setFilterKeyword(e.target.value)}
+                    placeholder="筛选模板名/提示词关键词"
+                    className="h-8"
+                  />
+                  <span className="text-xs text-muted-foreground shrink-0">
+                    {filteredPrompts.length}/{currentPrompts.length}
+                  </span>
+                </div>
+                <ScrollArea className="h-[calc(100%-44px)]">
+                  <div className="space-y-4 pr-4">
+                    {filteredPrompts.map((prompt, index) => (
                     <Card key={prompt.id} className="border border-border">
                       <CardContent className="p-4">
                         <div className="flex items-start justify-between mb-3">
@@ -658,27 +875,38 @@ export default function PromptConfig() {
                         </div>
                       </CardContent>
                     </Card>
-                  ))}
+                    ))}
 
-                  {currentPrompts.length === 0 && (
-                    <div className="text-center py-12">
-                      <p className="text-muted-foreground mb-4">
-                        当前类型暂无词库，请点击「新增词条」或「导入词库」
-                      </p>
-                      <div className="flex items-center justify-center gap-2">
-                        <Button variant="outline" onClick={handleAddPrompt}>
-                          <Plus className="w-4 h-4 mr-2" />
-                          新增词条
-                        </Button>
-                        <Button variant="outline" onClick={handleImportClick}>
-                          <Upload className="w-4 h-4 mr-2" />
-                          导入词库
-                        </Button>
+                    {currentPrompts.length === 0 && (
+                      <div className="text-center py-12">
+                        <p className="text-muted-foreground mb-4">
+                          当前类型暂无词库，请点击「新增词条」或「导入词库」
+                        </p>
+                        <div className="flex items-center justify-center gap-2">
+                          <Button variant="outline" onClick={handleAddPrompt}>
+                            <Plus className="w-4 h-4 mr-2" />
+                            新增词条
+                          </Button>
+                          <Button variant="outline" onClick={handleImportClick}>
+                            <Upload className="w-4 h-4 mr-2" />
+                            导入词库
+                          </Button>
+                          <Button variant="outline" onClick={handleOpenBulkDialog}>
+                            <ClipboardPaste className="w-4 h-4 mr-2" />
+                            批量粘贴
+                          </Button>
+                        </div>
                       </div>
-                    </div>
-                  )}
-                </div>
-              </ScrollArea>
+                    )}
+
+                    {currentPrompts.length > 0 && filteredPrompts.length === 0 && (
+                      <div className="text-center py-10 text-sm text-muted-foreground">
+                        没有匹配当前筛选条件的模板
+                      </div>
+                    )}
+                  </div>
+                </ScrollArea>
+              </div>
             ) : (
               <div className="flex items-center justify-center h-[calc(100vh-320px)]">
                 <p className="text-muted-foreground">请从左侧选择一个人群类型查看词库</p>
@@ -687,6 +915,63 @@ export default function PromptConfig() {
           </CardContent>
         </Card>
       </div>
+
+      <Dialog open={bulkDialogOpen} onOpenChange={setBulkDialogOpen}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>批量粘贴提示词</DialogTitle>
+            <DialogDescription>
+              支持三种格式：`模板名 + TAB + 正向 + TAB + 负向`、`模板名|正向|负向`、`每行一条正向提示词`。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3">
+            <div className="text-xs text-muted-foreground leading-5">
+              当前人群类型：{expandedType ? `${currentTypeName} (${expandedType})` : "未选择"}。  
+              粘贴后会按“模板名称 + 正向提示词 + 负向提示词”写入词库，模板名称可后续继续编辑。
+            </div>
+            <Textarea
+              value={bulkText}
+              onChange={(e) => setBulkText(e.target.value)}
+              rows={12}
+              className="font-mono text-xs"
+              placeholder={"模板一\t正向提示词\t负向提示词\n模板二\t正向提示词\t负向提示词"}
+            />
+            <div className="flex items-center gap-2 text-xs">
+              <input
+                id="bulk-replace-current"
+                type="checkbox"
+                checked={bulkReplaceCurrent}
+                onChange={(e) => setBulkReplaceCurrent(e.target.checked)}
+              />
+              <label htmlFor="bulk-replace-current" className="text-muted-foreground">
+                覆盖当前人群已有词库（不勾选则追加/同名更新）
+              </label>
+            </div>
+            <div className="text-xs text-muted-foreground">
+              预解析：可识别 {bulkPreview.items.length} 条
+              {bulkPreview.errors.length > 0 ? `，告警 ${bulkPreview.errors.length} 条` : ""}
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={handleFillBulkExample}>
+              填入参考示例
+            </Button>
+            <Button variant="outline" onClick={() => setBulkDialogOpen(false)}>
+              取消
+            </Button>
+            <Button onClick={handleBulkSubmit} disabled={isBulkSubmitting || !expandedType}>
+              {isBulkSubmitting ? (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              ) : (
+                <ClipboardPaste className="w-4 h-4 mr-2" />
+              )}
+              一键写入词库
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {isGenerating && genProgress && (
         <div className="fixed bottom-6 right-6 w-80 bg-popover border rounded-lg shadow-lg p-4 z-50">

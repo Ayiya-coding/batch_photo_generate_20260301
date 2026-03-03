@@ -21,7 +21,12 @@ from app.core.constants import CROWD_TYPES, SINGLE_TYPES
 from app.core.database import SessionLocal, get_db
 from app.core.settings_resolver import get_setting_value
 from app.models.database import BaseImage, GenerateTask, PromptTemplate
-from app.schemas.common import BaseResponse, PromptCreateRequest, PromptGenerateRequest
+from app.schemas.common import (
+    BaseResponse,
+    PromptBulkUpsertRequest,
+    PromptCreateRequest,
+    PromptGenerateRequest,
+)
 from app.services import progress_store as ps
 
 logger = logging.getLogger(__name__)
@@ -442,6 +447,87 @@ async def create_prompt(request: PromptCreateRequest, db: Session = Depends(get_
     db.add(tmpl)
     db.commit()
     return BaseResponse(code=0, message="提示词已创建", data={"id": tmpl.id, "updated": False})
+
+
+@router.post("/bulk-upsert", response_model=BaseResponse)
+async def bulk_upsert_prompts(request: PromptBulkUpsertRequest, db: Session = Depends(get_db)):
+    """
+    批量粘贴提示词写入
+    - 同 crowd_type + style_name 视为同一模板，执行 upsert
+    - replace_current=true 时会先停用该人群当前词库
+    """
+    crowd_type = request.crowd_type.strip().upper()
+    if crowd_type not in CROWD_TYPES:
+        return BaseResponse(code=1, message=f"无效的人群类型: {crowd_type}")
+
+    # 同一次请求中 style_name 去重：后者覆盖前者
+    dedup: dict[str, dict[str, Any]] = {}
+    for item in request.items:
+        style_name = item.style_name.strip()
+        if not style_name:
+            continue
+        dedup[style_name] = {
+            "style_name": style_name[:255],
+            "positive_prompt": item.positive_prompt.strip(),
+            "negative_prompt": (item.negative_prompt or "").strip(),
+            "reference_weight": _clamp_reference_weight(item.reference_weight, default=80),
+            "preferred_engine": _normalize_engine(item.preferred_engine, fallback="seedream"),
+            "is_active": bool(item.is_active),
+        }
+
+    if not dedup:
+        return BaseResponse(code=1, message="没有可写入的有效词条")
+
+    if request.replace_current:
+        db.query(PromptTemplate).filter(
+            PromptTemplate.crowd_type == crowd_type,
+            PromptTemplate.is_active.is_(True),
+        ).update({PromptTemplate.is_active: False}, synchronize_session=False)
+        db.commit()
+
+    created_count = 0
+    updated_count = 0
+    style_names = list(dedup.keys())
+
+    existing_templates = db.query(PromptTemplate).filter(
+        PromptTemplate.crowd_type == crowd_type,
+        PromptTemplate.style_name.in_(style_names),
+    ).all()
+    existing_map = {tmpl.style_name: tmpl for tmpl in existing_templates}
+
+    for style_name, payload in dedup.items():
+        existing = existing_map.get(style_name)
+        if existing:
+            existing.positive_prompt = payload["positive_prompt"]
+            existing.negative_prompt = payload["negative_prompt"]
+            existing.reference_weight = payload["reference_weight"]
+            existing.preferred_engine = payload["preferred_engine"]
+            existing.is_active = payload["is_active"]
+            updated_count += 1
+            continue
+
+        db.add(PromptTemplate(
+            crowd_type=crowd_type,
+            style_name=payload["style_name"],
+            positive_prompt=payload["positive_prompt"],
+            negative_prompt=payload["negative_prompt"],
+            reference_weight=payload["reference_weight"],
+            preferred_engine=payload["preferred_engine"],
+            is_active=payload["is_active"],
+        ))
+        created_count += 1
+
+    db.commit()
+    return BaseResponse(
+        code=0,
+        message=f"批量写入完成：新增 {created_count}，更新 {updated_count}",
+        data={
+            "crowd_type": crowd_type,
+            "created_count": created_count,
+            "updated_count": updated_count,
+            "total": len(dedup),
+        },
+    )
 
 
 @router.post("/import", response_model=BaseResponse)

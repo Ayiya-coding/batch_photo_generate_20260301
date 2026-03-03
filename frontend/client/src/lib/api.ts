@@ -256,6 +256,15 @@ export interface PromptCreatePayload {
   is_active?: boolean;
 }
 
+export interface PromptBulkItemPayload {
+  style_name: string;
+  positive_prompt: string;
+  negative_prompt?: string;
+  reference_weight?: number;
+  preferred_engine?: "seedream" | "nanobanana";
+  is_active?: boolean;
+}
+
 export const promptApi = {
   /** 一键生成提示词 */
   generate(batchId: string, crowdTypes?: string[], referenceImageId?: string, promptCount = 5) {
@@ -330,6 +339,22 @@ export const promptApi = {
     }>(
       http.post(API.prompt.import, form, {
         headers: { "Content-Type": "multipart/form-data" },
+      }),
+    );
+  },
+
+  /** 批量粘贴写入词条 */
+  bulkUpsert(crowdType: string, items: PromptBulkItemPayload[], replaceCurrent = false) {
+    return unwrap<{
+      crowd_type: string;
+      created_count: number;
+      updated_count: number;
+      total: number;
+    }>(
+      http.post(API.prompt.bulkUpsert, {
+        crowd_type: crowdType,
+        items,
+        replace_current: replaceCurrent,
       }),
     );
   },

@@ -43,6 +43,7 @@ class APIYiImageClient:
         seedream_model: str = "",
         nanobanana_model: str = "nano-banana-pro",
         disable_watermark: bool = True,
+        strict_reference: bool = True,
     ):
         self.api_key = api_key or app_settings.APIYI_API_KEY
         self.api_url = (api_url or app_settings.APIYI_API_URL).rstrip("/")
@@ -52,6 +53,7 @@ class APIYiImageClient:
         self.seedream_size = "1440x2560"  # Seedream 当前渠道要求 >= 3686400 像素，9:16 最小可用
         self.nanobanana_size = "576x1024"
         self.disable_watermark = disable_watermark
+        self.strict_reference = bool(strict_reference)
         self.last_error_code = ""
         self.last_error_message = ""
 
@@ -175,6 +177,12 @@ class APIYiImageClient:
 
         # 读取并压缩参考图片
         ref_b64 = self._load_reference_base64(reference_image_path)
+        if self.strict_reference and not ref_b64:
+            self._record_error(400, "strict_reference_missing")
+            self.last_error_code = "strict_reference_missing"
+            self.last_error_message = "strict_reference_missing"
+            logger.error("严格参考模式下缺少可用参考图，拒绝回退为文生图")
+            return False
 
         if engine == "seedream":
             ok = await self._generate_seedream(
@@ -254,12 +262,24 @@ class APIYiImageClient:
             self._apply_watermark_options(payload_with_ref)
             if await self._call_api(headers, payload_with_ref, output_path):
                 return True
+            if self.strict_reference:
+                logger.error(
+                    "严格参考模式：NanoBanana 参考图模式失败，不允许回退文本生图 | code=%s",
+                    self.last_error_code or "unknown",
+                )
+                return False
             logger.warning(
                 "NanoBanana 参考图模式失败，回退为纯文本生图 | code=%s",
                 self.last_error_code or "unknown",
             )
 
-        # 2) 回退为文本生图
+        if self.strict_reference:
+            self._record_error(400, "strict_reference_missing")
+            self.last_error_code = "strict_reference_missing"
+            self.last_error_message = "strict_reference_missing"
+            return False
+
+        # 2) 回退为文本生图（仅非严格参考模式）
         payload = dict(payload_base)
         self._apply_watermark_options(payload)
         return await self._call_api(headers, payload, output_path)
@@ -382,6 +402,7 @@ class ConcurrentImageGenerator:
         nanobanana_model: str = "nano-banana-pro",
         disable_watermark: bool = True,
         strict_no_watermark: bool = True,
+        strict_reference: bool = True,
         best_effort_watermark_cleanup: bool = True,
         watermark_cleanup_margin: float = 0.18,
         watermark_engine: str = "auto",
@@ -399,6 +420,7 @@ class ConcurrentImageGenerator:
             seedream_model=seedream_model,
             nanobanana_model=nanobanana_model,
             disable_watermark=disable_watermark,
+            strict_reference=strict_reference,
         )
         self.strict_no_watermark = strict_no_watermark
         self.best_effort_watermark_cleanup = bool(best_effort_watermark_cleanup)
@@ -433,6 +455,7 @@ class ConcurrentImageGenerator:
             "strict_no_watermark_cleanup_failed": "严格无水印校验失败，生成结果被拦截。",
             "watermark_remover_unavailable": "去水印引擎不可用（Volc/IOPaint），请检查去水印配置。",
             "watermark_cleanup_exception": "去水印处理异常，请查看后端日志。",
+            "strict_reference_missing": "严格参考模式下缺少可用参考图，任务被拦截。",
             "unknown_failure": "未知失败，请查看后端日志。",
         }
         return tips.get(reason_code, "任务失败，请查看详细日志。")

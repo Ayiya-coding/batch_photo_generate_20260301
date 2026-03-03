@@ -207,6 +207,9 @@ async def _async_batch_generate(batch_id: str, engine: str):
         strict_no_watermark = (
             get_setting_value(db, "strict_no_watermark", "1").strip() != "0"
         )
+        strict_reference_mode = (
+            get_setting_value(db, "strict_reference_mode", "1").strip() != "0"
+        )
         watermark_engine = _normalize_watermark_engine(
             get_setting_value(db, "watermark_engine", "auto")
         )
@@ -268,7 +271,10 @@ async def _async_batch_generate(batch_id: str, engine: str):
         ps.append_log(
             TASK_TYPE,
             batch_id,
-            f"[REF] 已准备背景参考图 {len(bg_reference_map)} 张（锁景点/光影，弱化原人像）",
+            (
+                f"[REF] 已准备背景参考图 {len(bg_reference_map)} 张（锁景点/光影，弱化原人像）"
+                f" | strict_reference={'开启' if strict_reference_mode else '关闭'}"
+            ),
         )
 
         generator = ConcurrentImageGenerator(
@@ -277,6 +283,7 @@ async def _async_batch_generate(batch_id: str, engine: str):
             nanobanana_model=nanobanana_model,
             disable_watermark=disable_generation_watermark,
             strict_no_watermark=strict_no_watermark,
+            strict_reference=strict_reference_mode,
             watermark_engine=watermark_engine,
             iopaint_url=settings.IOPAINT_URL,
             volc_access_key_id=volc_access_key_id,

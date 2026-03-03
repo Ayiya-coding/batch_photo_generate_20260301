@@ -96,6 +96,7 @@ DEFAULT_SETTINGS = [
     ("generate_model_version", "seedream-4-5-251128", "模型版本"),
     ("disable_generation_watermark", "1", "关闭生图水印(1=关闭/0=保留)"),
     ("strict_no_watermark", "1", "强制无水印校验(1=开启，失败则整张判失败)"),
+    ("strict_reference_mode", "1", "严格参考底图模式(1=开启，禁止回退为文生图)"),
     ("generate_prompt_prefix", "", "默认提示词前缀"),
     ("generate_prompt_suffix", "", "默认提示词后缀"),
     # 配置项5：宽脸版本生成配置
