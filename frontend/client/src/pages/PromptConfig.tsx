@@ -26,7 +26,6 @@ import {
   Pause,
   Plus,
   Upload,
-  Download,
   Search,
   ClipboardPaste,
 } from "lucide-react";
@@ -117,6 +116,65 @@ function parseBulkText(text: string, stylePrefix: string): ParsedBulkResult {
       }
       if (items.length > 0) return { items, errors: [] };
     }
+
+    // JSON 对象：支持 {模板名:{positive_prompt,negative_prompt}} / {模板名:"正向词"}
+    if (parsed && typeof parsed === "object") {
+      const obj = parsed as Record<string, unknown>;
+      const rows = Array.isArray(obj.rows) ? obj.rows : null;
+      if (rows) {
+        const items: PromptBulkItemPayload[] = [];
+        rows.forEach((raw, idx) => {
+          if (!raw || typeof raw !== "object") return;
+          const row = raw as Record<string, unknown>;
+          const styleName = String(row.style_name || `模板${String(idx + 1).padStart(2, "0")}`).trim();
+          const positive = String(row.positive_prompt || row.positive || row.prompt || "").trim();
+          const negative = String(row.negative_prompt || row.negative || "").trim();
+          if (!positive) return;
+          items.push({
+            style_name: styleName,
+            positive_prompt: positive,
+            negative_prompt: negative,
+            reference_weight: 90,
+            preferred_engine: "seedream",
+            is_active: true,
+          });
+        });
+        if (items.length > 0) return { items, errors: [] };
+      } else {
+        const items: PromptBulkItemPayload[] = [];
+        Object.entries(obj).forEach(([key, raw]) => {
+          if (!raw) return;
+          if (typeof raw === "string") {
+            const positive = raw.trim();
+            if (!positive) return;
+            items.push({
+              style_name: key.trim(),
+              positive_prompt: positive,
+              negative_prompt: "",
+              reference_weight: 90,
+              preferred_engine: "seedream",
+              is_active: true,
+            });
+            return;
+          }
+          if (typeof raw === "object") {
+            const row = raw as Record<string, unknown>;
+            const positive = String(row.positive_prompt || row.positive || row.prompt || row["正向"] || "").trim();
+            const negative = String(row.negative_prompt || row.negative || row["负向"] || "").trim();
+            if (!positive) return;
+            items.push({
+              style_name: key.trim(),
+              positive_prompt: positive,
+              negative_prompt: negative,
+              reference_weight: 90,
+              preferred_engine: "seedream",
+              is_active: true,
+            });
+          }
+        });
+        if (items.length > 0) return { items, errors: [] };
+      }
+    }
   } catch {
     // not json
   }
@@ -124,7 +182,72 @@ function parseBulkText(text: string, stylePrefix: string): ParsedBulkResult {
   const lines = content.split("\n").map((x) => x.trim()).filter(Boolean);
   const errors: string[] = [];
 
-  // 2) 表格行：模板名<TAB>正向<TAB>负向 或 模板名|正向|负向
+  // 2) Markdown 表格
+  if (
+    lines.length >= 2
+    && lines[0].includes("|")
+    && /^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?$/.test(lines[1])
+  ) {
+    const headers = lines[0]
+      .replace(/^\|/, "")
+      .replace(/\|$/, "")
+      .split("|")
+      .map((x) => x.trim().toLowerCase());
+    const items: PromptBulkItemPayload[] = [];
+    for (let i = 2; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.includes("|")) continue;
+      const cols = line
+        .replace(/^\|/, "")
+        .replace(/\|$/, "")
+        .split("|")
+        .map((x) => x.trim());
+      if (cols.length === 0) continue;
+      const row: Record<string, string> = {};
+      headers.forEach((h, idx) => {
+        row[h] = cols[idx] || "";
+      });
+      const styleName = (
+        row["style_name"]
+        || row["style"]
+        || row["模板名"]
+        || row["模板"]
+        || row["名称"]
+        || `${stylePrefix}${String(items.length + 1).padStart(2, "0")}`
+      ).trim();
+      const positive = (
+        row["positive_prompt"]
+        || row["positive"]
+        || row["prompt"]
+        || row["正向提示词"]
+        || row["正向"]
+        || row["提示词"]
+        || ""
+      ).trim();
+      const negative = (
+        row["negative_prompt"]
+        || row["negative"]
+        || row["负向提示词"]
+        || row["负向"]
+        || ""
+      ).trim();
+      if (!positive) {
+        errors.push(`Markdown 第 ${i + 1} 行正向提示词为空`);
+        continue;
+      }
+      items.push({
+        style_name: styleName,
+        positive_prompt: positive,
+        negative_prompt: negative,
+        reference_weight: 90,
+        preferred_engine: "seedream",
+        is_active: true,
+      });
+    }
+    return { items, errors };
+  }
+
+  // 3) 表格行：模板名<TAB>正向<TAB>负向 或 模板名|正向|负向
   const tableSep = lines.some((line) => line.includes("\t")) ? "\t" : (lines.some((line) => line.includes("|")) ? "|" : "");
   if (tableSep) {
     const items: PromptBulkItemPayload[] = [];
@@ -158,7 +281,7 @@ function parseBulkText(text: string, stylePrefix: string): ParsedBulkResult {
     return { items, errors };
   }
 
-  // 3) 分块格式：每块 1~3 行（模板名/正向/负向），块之间用 ---
+  // 4) 分块格式：每块 1~3 行（模板名/正向/负向），块之间用 ---
   if (content.includes("\n---")) {
     const blocks = content.split(/\n---+\n/g).map((blk) => blk.trim()).filter(Boolean);
     const items: PromptBulkItemPayload[] = [];
@@ -196,7 +319,7 @@ function parseBulkText(text: string, stylePrefix: string): ParsedBulkResult {
     return { items, errors };
   }
 
-  // 4) 最简格式：每行一条正向提示词，模板名自动生成
+  // 5) 最简格式：每行一条正向提示词，模板名自动生成
   const fallbackItems = lines.map((line, idx) => ({
     style_name: `${stylePrefix}${String(idx + 1).padStart(2, "0")}`,
     positive_prompt: line,
@@ -224,9 +347,11 @@ export default function PromptConfig() {
   const [isImporting, setIsImporting] = useState(false);
   const [isBulkSubmitting, setIsBulkSubmitting] = useState(false);
   const [genProgress, setGenProgress] = useState<ProgressInfo | null>(null);
-  const [bulkDialogOpen, setBulkDialogOpen] = useState(false);
+  const [importDialogOpen, setImportDialogOpen] = useState(false);
+  const [importMode, setImportMode] = useState<"text" | "file">("text");
   const [bulkText, setBulkText] = useState("");
-  const [bulkReplaceCurrent, setBulkReplaceCurrent] = useState(false);
+  const [replaceCurrent, setReplaceCurrent] = useState(false);
+  const [importFile, setImportFile] = useState<File | null>(null);
 
   const [loadingImages, setLoadingImages] = useState(false);
   const [loadingPrompts, setLoadingPrompts] = useState(false);
@@ -474,56 +599,30 @@ export default function PromptConfig() {
     }
   }, [batchId, expandedType, promptMap, loadPrompts]);
 
-  const handleDownloadTemplate = useCallback(() => {
-    const fallbackType = expandedType || "C02";
-    const typeName = allTypes.find((t) => t.id === fallbackType)?.name || fallbackType;
-    const csvContent = [
-      "crowd_type,style_name,positive_prompt,negative_prompt,reference_weight,preferred_engine,is_active",
-      `${fallbackType},"${typeName}穿搭01","保持原图背景和光影不变，仅替换${typeName}人物主体；服装：新中式套装，发型：简洁盘发，姿态：自然站立，景别：半身，站位：画面右侧三分之一","背景替换,地标变更,多人物,脸部遮挡",90,seedream,true`,
-      `${fallbackType},"${typeName}穿搭02","保持原图背景和光影不变，仅替换${typeName}人物主体；服装：都市轻通勤，发型：低马尾，姿态：扶栏轻倚，景别：全身，站位：前景偏左","背景替换,地标变更,多人物,脸部遮挡",90,seedream,true`,
-    ].join("\n");
+  const handleOpenImportDialog = useCallback(() => {
+    if (!expandedType) {
+      toast.info("请先选择人群类型");
+      return;
+    }
+    setImportDialogOpen(true);
+    setImportMode("text");
+    setImportFile(null);
+    if (!bulkText.trim()) {
+      const typeName = allTypes.find((t) => t.id === expandedType)?.name || "人物";
+      setBulkText(
+        `模板一\t保持原图背景和光影不变，仅替换${typeName}人物；服装：新中式套装；发型：简洁盘发；姿态：自然站立；景别：半身；站位：右侧三分之一\t背景替换,地标变更,多人物,脸部遮挡\n模板二\t保持原图背景和光影不变，仅替换${typeName}人物；服装：都市轻通勤；发型：低马尾；姿态：扶栏轻倚；景别：全身；站位：前景偏左\t背景替换,地标变更,多人物,脸部遮挡`
+      );
+    }
+  }, [expandedType, bulkText]);
 
-    const blob = new Blob(["\uFEFF" + csvContent], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "prompt-template.csv";
-    a.click();
-    URL.revokeObjectURL(url);
-    toast.success("已下载导入模板");
-  }, [expandedType]);
-
-  const handleImportClick = useCallback(() => {
+  const handleSelectImportFile = useCallback(() => {
     importInputRef.current?.click();
   }, []);
 
-  const handleImportChange = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    if (!batchId) {
-      toast.error("请先上传并选择一个批次");
-      event.target.value = "";
-      return;
-    }
-
-    const targetType = expandedType || undefined;
-    const replaceCurrent = !!targetType
-      && window.confirm("是否覆盖当前人群已有词条？选择“取消”则为追加导入。");
-
-    setIsImporting(true);
-    const result = await promptApi.importTemplates(file, targetType, replaceCurrent);
-    setIsImporting(false);
-    event.target.value = "";
-
-    if (result) {
-      toast.success(`导入完成：新增 ${result.created_count}，更新 ${result.updated_count}`);
-      if (result.error_count > 0) {
-        toast.warning(`有 ${result.error_count} 行导入失败，请检查模板格式`);
-      }
-      await loadPrompts();
-    }
-  }, [batchId, expandedType, loadPrompts]);
+  const handleImportFileChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0] || null;
+    setImportFile(file);
+  }, []);
 
   const getTypePromptCount = (typeId: string) => promptMap[typeId]?.length || 0;
   const currentPrompts = expandedType ? (promptMap[expandedType] || []) : [];
@@ -539,20 +638,6 @@ export default function PromptConfig() {
   });
   const bulkPreview = parseBulkText(bulkText, `${currentTypeName}模板`);
 
-  const handleOpenBulkDialog = useCallback(() => {
-    if (!expandedType) {
-      toast.info("请先选择人群类型");
-      return;
-    }
-    setBulkDialogOpen(true);
-    if (!bulkText.trim()) {
-      const typeName = allTypes.find((t) => t.id === expandedType)?.name || "人物";
-      setBulkText(
-        `模板一\t保持原图背景和光影不变，仅替换${typeName}人物；服装：新中式套装；发型：简洁盘发；姿态：自然站立；景别：半身；站位：右侧三分之一\t背景替换,地标变更,多人物,脸部遮挡\n模板二\t保持原图背景和光影不变，仅替换${typeName}人物；服装：都市轻通勤；发型：低马尾；姿态：扶栏轻倚；景别：全身；站位：前景偏左\t背景替换,地标变更,多人物,脸部遮挡`
-      );
-    }
-  }, [expandedType, bulkText]);
-
   const handleFillBulkExample = useCallback(() => {
     if (!expandedType) return;
     const typeName = allTypes.find((t) => t.id === expandedType)?.name || "人物";
@@ -561,6 +646,61 @@ export default function PromptConfig() {
     );
     toast.info("已填入参考示例，可直接改写后导入");
   }, [expandedType]);
+
+  const handleFillMarkdownExample = useCallback(() => {
+    const typeName = currentTypeName || "人物";
+    setBulkText(
+      `| 模板名 | 正向提示词 | 负向提示词 |\n|---|---|---|\n| 模板一 | 严格参考原图背景和光影，仅替换${typeName}主体；服饰：新中式套装；发型：低盘发；动作：扶栏微笑；景别：半身；站位：右侧三分之一 | 背景替换,地标变更,多人,遮挡脸 |\n| 模板二 | 严格参考原图背景和光影，仅替换${typeName}主体；服饰：都市通勤西装；发型：低马尾；动作：自然前行；景别：全身；站位：前景偏左 | 背景替换,地标变更,多人,遮挡脸 |`
+    );
+    toast.info("已填入 Markdown 表格示例");
+  }, [currentTypeName]);
+
+  const handleFillJsonExample = useCallback(() => {
+    const typeName = currentTypeName || "人物";
+    setBulkText(
+      JSON.stringify(
+        {
+          模板一: {
+            positive_prompt: `严格参考原图背景和光影，仅替换${typeName}主体；服饰：新中式套装；发型：低盘发；动作：扶栏微笑；景别：半身；站位：右侧三分之一`,
+            negative_prompt: "背景替换,地标变更,多人,遮挡脸",
+          },
+          模板二: {
+            positive_prompt: `严格参考原图背景和光影，仅替换${typeName}主体；服饰：都市通勤西装；发型：低马尾；动作：自然前行；景别：全身；站位：前景偏左`,
+            negative_prompt: "背景替换,地标变更,多人,遮挡脸",
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    toast.info("已填入 JSON 示例");
+  }, [currentTypeName]);
+
+  const handleFileImportSubmit = useCallback(async () => {
+    if (!expandedType) {
+      toast.info("请先选择人群类型");
+      return;
+    }
+    if (!batchId) {
+      toast.error("请先上传并选择一个批次");
+      return;
+    }
+    if (!importFile) {
+      toast.error("请先选择 CSV 或 JSON 文件");
+      return;
+    }
+    setIsImporting(true);
+    const result = await promptApi.importTemplates(importFile, expandedType, replaceCurrent);
+    setIsImporting(false);
+    if (result) {
+      toast.success(`文件导入完成：新增 ${result.created_count}，更新 ${result.updated_count}`);
+      if (result.error_count > 0) {
+        toast.warning(`有 ${result.error_count} 行导入失败，请检查文件格式`);
+      }
+      setImportDialogOpen(false);
+      await loadPrompts();
+    }
+  }, [expandedType, batchId, importFile, replaceCurrent, loadPrompts]);
 
   const handleBulkSubmit = useCallback(async () => {
     if (!expandedType) {
@@ -578,14 +718,14 @@ export default function PromptConfig() {
     }
 
     setIsBulkSubmitting(true);
-    const result = await promptApi.bulkUpsert(expandedType, parsed.items, bulkReplaceCurrent);
+    const result = await promptApi.bulkUpsert(expandedType, parsed.items, replaceCurrent);
     setIsBulkSubmitting(false);
     if (result) {
       toast.success(`批量写入完成：新增 ${result.created_count}，更新 ${result.updated_count}`);
-      setBulkDialogOpen(false);
+      setImportDialogOpen(false);
       await loadPrompts();
     }
-  }, [expandedType, bulkText, bulkReplaceCurrent, loadPrompts]);
+  }, [expandedType, bulkText, replaceCurrent, loadPrompts]);
 
   return (
     <MainLayout
@@ -602,20 +742,8 @@ export default function PromptConfig() {
             <Save className="w-4 h-4 mr-2" />
             保存配置
           </Button>
-          <Button variant="outline" size="sm" onClick={handleDownloadTemplate}>
-            <Download className="w-4 h-4 mr-2" />
-            下载模板
-          </Button>
-          <Button variant="outline" size="sm" onClick={handleOpenBulkDialog}>
+          <Button variant="outline" size="sm" onClick={handleOpenImportDialog}>
             <ClipboardPaste className="w-4 h-4 mr-2" />
-            批量粘贴
-          </Button>
-          <Button variant="outline" size="sm" onClick={handleImportClick} disabled={isImporting}>
-            {isImporting ? (
-              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-            ) : (
-              <Upload className="w-4 h-4 mr-2" />
-            )}
             导入词库
           </Button>
           {isGenerating && (
@@ -651,14 +779,6 @@ export default function PromptConfig() {
         </div>
       }
     >
-      <input
-        ref={importInputRef}
-        type="file"
-        className="hidden"
-        accept=".csv,.json"
-        onChange={handleImportChange}
-      />
-
       <div className="flex gap-4 h-[calc(100vh-140px)]">
         <Card className="w-[140px] shrink-0 flex flex-col">
           <CardHeader className="py-2 px-3 shrink-0">
@@ -887,13 +1007,9 @@ export default function PromptConfig() {
                             <Plus className="w-4 h-4 mr-2" />
                             新增词条
                           </Button>
-                          <Button variant="outline" onClick={handleImportClick}>
-                            <Upload className="w-4 h-4 mr-2" />
-                            导入词库
-                          </Button>
-                          <Button variant="outline" onClick={handleOpenBulkDialog}>
+                          <Button variant="outline" onClick={handleOpenImportDialog}>
                             <ClipboardPaste className="w-4 h-4 mr-2" />
-                            批量粘贴
+                            导入词库
                           </Button>
                         </div>
                       </div>
@@ -916,41 +1032,95 @@ export default function PromptConfig() {
         </Card>
       </div>
 
-      <Dialog open={bulkDialogOpen} onOpenChange={setBulkDialogOpen}>
+      <Dialog open={importDialogOpen} onOpenChange={setImportDialogOpen}>
         <DialogContent className="max-w-3xl">
           <DialogHeader>
-            <DialogTitle>批量粘贴提示词</DialogTitle>
+            <DialogTitle>导入词库</DialogTitle>
             <DialogDescription>
-              支持三种格式：`模板名 + TAB + 正向 + TAB + 负向`、`模板名|正向|负向`、`每行一条正向提示词`。
+              推荐使用文本粘贴（Markdown/JSON/普通表格），也支持 CSV/JSON 文件导入。
             </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-3">
-            <div className="text-xs text-muted-foreground leading-5">
-              当前人群类型：{expandedType ? `${currentTypeName} (${expandedType})` : "未选择"}。  
-              粘贴后会按“模板名称 + 正向提示词 + 负向提示词”写入词库，模板名称可后续继续编辑。
+            <div className="flex items-center gap-2">
+              <Button
+                variant={importMode === "text" ? "default" : "outline"}
+                size="sm"
+                onClick={() => setImportMode("text")}
+              >
+                <ClipboardPaste className="w-4 h-4 mr-2" />
+                文本粘贴（推荐）
+              </Button>
+              <Button
+                variant={importMode === "file" ? "default" : "outline"}
+                size="sm"
+                onClick={() => setImportMode("file")}
+              >
+                <Upload className="w-4 h-4 mr-2" />
+                文件导入（CSV/JSON）
+              </Button>
             </div>
-            <Textarea
-              value={bulkText}
-              onChange={(e) => setBulkText(e.target.value)}
-              rows={12}
-              className="font-mono text-xs"
-              placeholder={"模板一\t正向提示词\t负向提示词\n模板二\t正向提示词\t负向提示词"}
-            />
+
+            <div className="text-xs text-muted-foreground leading-5">
+              当前人群类型：{expandedType ? `${currentTypeName} (${expandedType})` : "未选择"}。
+              导入后会按“模板名称 + 正向提示词 + 负向提示词”写入词库，模板名称可后续继续编辑和筛选。
+            </div>
+
+            {importMode === "text" ? (
+              <>
+                <Textarea
+                  value={bulkText}
+                  onChange={(e) => setBulkText(e.target.value)}
+                  rows={12}
+                  className="font-mono text-xs"
+                  placeholder={"模板一\t正向提示词\t负向提示词\n模板二\t正向提示词\t负向提示词"}
+                />
+                <div className="text-xs text-muted-foreground">
+                  预解析：可识别 {bulkPreview.items.length} 条
+                  {bulkPreview.errors.length > 0 ? `，告警 ${bulkPreview.errors.length} 条` : ""}
+                </div>
+                <div className="text-xs text-muted-foreground leading-5">
+                  支持语法：
+                  1) TAB/竖线表格（`模板名 + 正向 + 负向`）
+                  2) Markdown 表格
+                  3) JSON（数组或键值对）
+                  4) 每行一条正向提示词
+                </div>
+              </>
+            ) : (
+              <div className="space-y-3">
+                <input
+                  ref={importInputRef}
+                  type="file"
+                  className="hidden"
+                  accept=".csv,.json"
+                  onChange={handleImportFileChange}
+                />
+                <div className="flex items-center gap-2">
+                  <Button variant="outline" onClick={handleSelectImportFile} disabled={isImporting}>
+                    <Upload className="w-4 h-4 mr-2" />
+                    选择文件
+                  </Button>
+                  <span className="text-xs text-muted-foreground">
+                    {importFile ? importFile.name : "未选择文件"}
+                  </span>
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  文件格式支持：`.csv`、`.json`。建议优先使用“文本粘贴（推荐）”。
+                </div>
+              </div>
+            )}
+
             <div className="flex items-center gap-2 text-xs">
               <input
-                id="bulk-replace-current"
+                id="replace-current"
                 type="checkbox"
-                checked={bulkReplaceCurrent}
-                onChange={(e) => setBulkReplaceCurrent(e.target.checked)}
+                checked={replaceCurrent}
+                onChange={(e) => setReplaceCurrent(e.target.checked)}
               />
-              <label htmlFor="bulk-replace-current" className="text-muted-foreground">
+              <label htmlFor="replace-current" className="text-muted-foreground">
                 覆盖当前人群已有词库（不勾选则追加/同名更新）
               </label>
-            </div>
-            <div className="text-xs text-muted-foreground">
-              预解析：可识别 {bulkPreview.items.length} 条
-              {bulkPreview.errors.length > 0 ? `，告警 ${bulkPreview.errors.length} 条` : ""}
             </div>
           </div>
 
@@ -958,17 +1128,34 @@ export default function PromptConfig() {
             <Button variant="outline" onClick={handleFillBulkExample}>
               填入参考示例
             </Button>
-            <Button variant="outline" onClick={() => setBulkDialogOpen(false)}>
+            <Button variant="outline" onClick={handleFillMarkdownExample}>
+              Markdown 示例
+            </Button>
+            <Button variant="outline" onClick={handleFillJsonExample}>
+              JSON 示例
+            </Button>
+            <Button variant="outline" onClick={() => setImportDialogOpen(false)}>
               取消
             </Button>
-            <Button onClick={handleBulkSubmit} disabled={isBulkSubmitting || !expandedType}>
-              {isBulkSubmitting ? (
-                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-              ) : (
-                <ClipboardPaste className="w-4 h-4 mr-2" />
-              )}
-              一键写入词库
-            </Button>
+            {importMode === "text" ? (
+              <Button onClick={handleBulkSubmit} disabled={isBulkSubmitting || !expandedType}>
+                {isBulkSubmitting ? (
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                ) : (
+                  <ClipboardPaste className="w-4 h-4 mr-2" />
+                )}
+                一键写入词库
+              </Button>
+            ) : (
+              <Button onClick={handleFileImportSubmit} disabled={isImporting || !expandedType}>
+                {isImporting ? (
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                ) : (
+                  <Upload className="w-4 h-4 mr-2" />
+                )}
+                开始文件导入
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>
