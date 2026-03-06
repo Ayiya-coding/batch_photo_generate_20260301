@@ -11,6 +11,7 @@ from app.core.logger import logger
 
 # 导入路由
 from app.api import (
+    backup,
     upload,
     preprocess,
     prompt,
@@ -74,6 +75,7 @@ app.include_router(template.router, prefix="/api/template", tags=["模板管理"
 app.include_router(wideface.router, prefix="/api/wideface", tags=["宽脸图生成"])
 app.include_router(compress.router, prefix="/api/compress", tags=["画质压缩"])
 app.include_router(export.router, prefix="/api/export", tags=["批量导出"])
+app.include_router(backup.router, prefix="/api/backup", tags=["备份恢复"])
 app.include_router(settings.router, prefix="/api/settings", tags=["系统设置"])
 
 # 静态文件服务 — 让前端通过 /api/files/uploads/xxx.jpg 访问上传的图片

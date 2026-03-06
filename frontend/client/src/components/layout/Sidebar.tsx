@@ -9,6 +9,7 @@ import {
   LayoutGrid,
   CircleUser,
   ImageUp,
+  Database,
   Settings,
 } from "lucide-react";
 
@@ -28,6 +29,7 @@ const navItems: NavItem[] = [
   { id: "template", label: "模板管理", icon: <LayoutGrid className="w-[18px] h-[18px]" />, path: "/template" },
   { id: "wideface", label: "宽脸图", icon: <CircleUser className="w-[18px] h-[18px]" />, path: "/wideface" },
   { id: "process", label: "画面处理", icon: <ImageUp className="w-[18px] h-[18px]" />, path: "/process" },
+  { id: "backup", label: "备份恢复", icon: <Database className="w-[18px] h-[18px]" />, path: "/backup" },
   { id: "settings", label: "系统设置", icon: <Settings className="w-[18px] h-[18px]" />, path: "/settings" },
 ];
 

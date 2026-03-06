@@ -139,6 +139,60 @@ class PromptGenerateRequest(BaseModel):
         return _check_uuid(v, "reference_image_id")
 
 
+class PromptBulkItemInput(BaseModel):
+    """单条灵活导入的提示词模板"""
+    style_name: str = Field(..., min_length=1, max_length=255)
+    positive_prompt: str = Field(..., min_length=1, max_length=20000)
+    negative_prompt: str = Field("", max_length=20000)
+    reference_weight: int = Field(90, ge=0, le=100)
+    preferred_engine: Optional[str] = Field("seedream", max_length=50)
+    is_active: bool = True
+
+    @field_validator("preferred_engine")
+    @classmethod
+    def _bulk_item_engine(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _VALID_ENGINES:
+            raise ValueError(f"引擎必须为 {_VALID_ENGINES} 之一")
+        return v
+
+
+class PromptBulkUpsertRequest(BaseModel):
+    """按单个人群类型批量写入提示词"""
+    crowd_type: str
+    items: List[PromptBulkItemInput] = Field(..., min_length=1, max_length=500)
+    replace_current: bool = False
+
+    @field_validator("crowd_type")
+    @classmethod
+    def _bulk_crowd_type(cls, v: str) -> str:
+        if v not in _VALID_CROWD_IDS:
+            raise ValueError(f"无效的人群类型: {v}")
+        return v
+
+
+class PromptTaskCreateRequest(BaseModel):
+    """按当前词库创建生图任务"""
+    batch_id: str
+    crowd_types: Optional[List[str]] = Field(None, description="指定人群类型，不指定则按当前全部词库创建")
+    clear_existing: bool = Field(True, description="是否清理当前批次已有任务后再重建")
+    strict_reference: Optional[bool] = Field(None, description="是否启用严格参考模式，默认跟随后端设置")
+
+    @field_validator("batch_id")
+    @classmethod
+    def _task_batch_id(cls, v: str) -> str:
+        return _check_uuid(v, "batch_id")
+
+    @field_validator("crowd_types")
+    @classmethod
+    def _task_crowd_types(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is None:
+            return v
+        bad = [c for c in v if c not in _VALID_CROWD_IDS]
+        if bad:
+            raise ValueError(f"无效的人群类型: {bad}")
+        return v
+
+
 class PromptResponse(BaseModel):
     """提示词响应"""
     batch_id: str
@@ -311,6 +365,79 @@ class ExportRequest(BaseModel):
         if v is not None and ".." in v:
             raise ValueError("路径不允许包含 '..'")
         return v
+
+
+# ===== 备份恢复 =====
+class BackupSettingItem(BaseModel):
+    """备份中的单个系统设置"""
+    key: str = Field(..., min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_]+$")
+    value: str = Field("", max_length=10000)
+    description: str = Field("", max_length=1000)
+
+
+class BackupPromptTemplateItem(BaseModel):
+    """备份中的单条提示词模板"""
+    id: Optional[str] = Field(None, max_length=36)
+    crowd_type: str
+    style_name: str = Field(..., min_length=1, max_length=255)
+    positive_prompt: str = Field(..., min_length=1, max_length=20000)
+    negative_prompt: str = Field("", max_length=20000)
+    reference_weight: int = Field(80, ge=0, le=100)
+    preferred_engine: Optional[str] = Field("seedream", max_length=50)
+    is_active: bool = True
+    create_time: Optional[datetime] = None
+
+    @field_validator("id")
+    @classmethod
+    def _prompt_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or v == "":
+            return None
+        return _check_uuid(v, "prompt_template.id")
+
+    @field_validator("crowd_type")
+    @classmethod
+    def _backup_crowd_type(cls, v: str) -> str:
+        if v not in _VALID_CROWD_IDS:
+            raise ValueError(f"无效的人群类型: {v}")
+        return v
+
+    @field_validator("preferred_engine")
+    @classmethod
+    def _backup_engine(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _VALID_ENGINES:
+            raise ValueError(f"引擎必须为 {_VALID_ENGINES} 之一")
+        return v
+
+
+class BackupPayload(BaseModel):
+    """导出的备份内容"""
+    version: str = Field(..., min_length=1, max_length=50)
+    exported_at: datetime
+    app_name: str = Field(..., min_length=1, max_length=100)
+    contains_secrets: bool = True
+    settings: List[BackupSettingItem] = Field(default_factory=list, max_length=200)
+    prompt_templates: List[BackupPromptTemplateItem] = Field(default_factory=list, max_length=5000)
+
+
+class BackupImportRequest(BaseModel):
+    """导入备份请求"""
+    backup: BackupPayload
+    restore_settings: bool = True
+    restore_prompts: bool = True
+
+
+class PromptLibraryPayload(BaseModel):
+    """提示词词库导出内容"""
+    version: str = Field(..., min_length=1, max_length=50)
+    exported_at: datetime
+    app_name: str = Field(..., min_length=1, max_length=100)
+    prompts: List[BackupPromptTemplateItem] = Field(default_factory=list, max_length=5000)
+
+
+class PromptLibraryImportRequest(BaseModel):
+    """提示词词库导入请求"""
+    library: PromptLibraryPayload
+    replace_existing: bool = True
 
 
 # ===== 系统设置 =====

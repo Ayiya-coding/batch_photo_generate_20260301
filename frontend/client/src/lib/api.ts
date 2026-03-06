@@ -246,6 +246,38 @@ export interface PromptItem {
   task_count: number;
 }
 
+export interface PromptLibraryItem {
+  id?: string;
+  crowd_type: string;
+  style_name: string;
+  positive_prompt: string;
+  negative_prompt: string;
+  reference_weight: number;
+  preferred_engine?: string | null;
+  is_active: boolean;
+  create_time?: string | null;
+}
+
+export interface PromptLibraryPayload {
+  version: string;
+  exported_at: string;
+  app_name: string;
+  prompts: PromptLibraryItem[];
+  summary?: {
+    prompt_count: number;
+    crowd_type_count: number;
+  };
+}
+
+export interface PromptBulkItemPayload {
+  style_name: string;
+  positive_prompt: string;
+  negative_prompt?: string;
+  reference_weight?: number;
+  preferred_engine?: "seedream" | "nanobanana";
+  is_active?: boolean;
+}
+
 export const promptApi = {
   /** 一键生成提示词 */
   generate(
@@ -274,6 +306,61 @@ export const promptApi = {
   /** 查询生成进度 */
   progress(batchId: string) {
     return unwrap<ProgressInfo>(http.get(API.prompt.progress(batchId)));
+  },
+
+  /** 导出整个提示词词库 */
+  exportLibrary() {
+    return unwrap<PromptLibraryPayload>(http.get(API.prompt.exportLibrary));
+  },
+
+  /** 导入整个提示词词库 */
+  importLibrary(library: PromptLibraryPayload, replaceExisting = true) {
+    return unwrap<{
+      replace_existing: boolean;
+      deleted_count: number;
+      created_count: number;
+      updated_count: number;
+      prompt_count: number;
+    }>(
+      http.post(API.prompt.importLibrary, {
+        library,
+        replace_existing: replaceExisting,
+      }),
+    );
+  },
+
+  /** 按当前类型批量写入灵活导入的模板 */
+  bulkUpsert(crowdType: string, items: PromptBulkItemPayload[], replaceCurrent = false) {
+    return unwrap<{
+      crowd_type: string;
+      created_count: number;
+      updated_count: number;
+      total: number;
+    }>(
+      http.post(API.prompt.bulkUpsert, {
+        crowd_type: crowdType,
+        items,
+        replace_current: replaceCurrent,
+      }),
+    );
+  },
+
+  /** 根据当前词库为批次创建任务 */
+  createTasks(batchId: string, crowdTypes?: string[], clearExisting = true, strictReference?: boolean) {
+    return unwrap<{
+      batch_id: string;
+      base_image_count: number;
+      template_count: number;
+      pending_count: number;
+      clear_existing: boolean;
+    }>(
+      http.post(API.prompt.createTasks, {
+        batch_id: batchId,
+        crowd_types: crowdTypes,
+        clear_existing: clearExisting,
+        strict_reference: strictReference,
+      }),
+    );
   },
 
   /** 获取提示词列表 */
@@ -584,6 +671,67 @@ export const exportApi = {
   /** 查询导出进度 */
   progress() {
     return unwrap<ProgressInfo>(http.get(API.export.progress));
+  },
+};
+
+// ---------- 备份恢复模块 ----------
+
+export interface BackupSettingItem {
+  key: string;
+  value: string;
+  description: string;
+}
+
+export interface BackupPromptTemplateItem {
+  id?: string;
+  crowd_type: string;
+  style_name: string;
+  positive_prompt: string;
+  negative_prompt: string;
+  reference_weight: number;
+  preferred_engine?: string | null;
+  is_active: boolean;
+  create_time?: string | null;
+}
+
+export interface BackupPayload {
+  version: string;
+  exported_at: string;
+  app_name: string;
+  contains_secrets: boolean;
+  settings: BackupSettingItem[];
+  prompt_templates: BackupPromptTemplateItem[];
+  summary?: {
+    settings_count: number;
+    prompt_count: number;
+  };
+}
+
+export interface BackupImportResult {
+  restore_settings: boolean;
+  restore_prompts: boolean;
+  settings_created: number;
+  settings_updated: number;
+  prompts_deleted: number;
+  prompts_created: number;
+  imported_at: string;
+}
+
+export const backupApi = {
+  /** 导出备份内容 */
+  exportData() {
+    return unwrap<BackupPayload>(http.get(API.backup.export));
+  },
+
+  /** 导入备份内容 */
+  importData(backup: BackupPayload, restoreSettings = true, restorePrompts = true) {
+    return unwrap<BackupImportResult>(
+      http.post(API.backup.import, {
+        backup,
+        restore_settings: restoreSettings,
+        restore_prompts: restorePrompts,
+      }),
+    );
   },
 };
 

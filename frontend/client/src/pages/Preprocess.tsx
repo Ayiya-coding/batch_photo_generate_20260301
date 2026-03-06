@@ -1278,7 +1278,7 @@ export default function Preprocess() {
         success = await simulateSingle();
       }
 
-      let nextImages = images.map((item) =>
+      let nextImages: PreprocessImage[] = images.map((item): PreprocessImage =>
         item.id === current.id
           ? {
               ...item,
@@ -1293,7 +1293,7 @@ export default function Preprocess() {
       if (success && dataSource === "api" && batchId) {
         const detail = await uploadApi.getBatch(batchId);
         if (detail?.images) {
-          nextImages = nextImages.map((item) => {
+          nextImages = nextImages.map((item): PreprocessImage => {
             const remote = detail.images.find((r) => r.id === item.id);
             if (!remote) return item;
             return {

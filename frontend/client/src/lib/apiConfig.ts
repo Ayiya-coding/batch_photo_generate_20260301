@@ -26,6 +26,10 @@ export const API = {
     generate: `${API_BASE}/prompt/generate`,
     progress: (batchId: string) => `${API_BASE}/prompt/progress/${batchId}`,
     cancel: (batchId: string) => `${API_BASE}/prompt/cancel/${batchId}`,
+    bulkUpsert: `${API_BASE}/prompt/bulk-upsert`,
+    exportLibrary: `${API_BASE}/prompt/export`,
+    importLibrary: `${API_BASE}/prompt/import`,
+    createTasks: `${API_BASE}/prompt/create-tasks`,
     list: `${API_BASE}/prompt/list`,
     edit: (id: string) => `${API_BASE}/prompt/edit/${id}`,
     delete: (id: string) => `${API_BASE}/prompt/delete/${id}`,
@@ -81,6 +85,12 @@ export const API = {
   export: {
     start: `${API_BASE}/export/start`,
     progress: `${API_BASE}/export/progress`,
+  },
+
+  // ===== 备份恢复 =====
+  backup: {
+    export: `${API_BASE}/backup/export`,
+    import: `${API_BASE}/backup/import`,
   },
 
   // ===== 系统设置 =====

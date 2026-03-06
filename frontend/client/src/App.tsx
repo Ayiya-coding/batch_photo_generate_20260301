@@ -18,6 +18,7 @@ const ReviewClassify = lazy(() => import("./pages/ReviewClassify"));
 const TemplateManage = lazy(() => import("./pages/TemplateManage"));
 const WideFace = lazy(() => import("./pages/WideFace"));
 const ImageProcess = lazy(() => import("./pages/ImageProcess"));
+const BackupRestore = lazy(() => import("./pages/BackupRestore"));
 const Settings = lazy(() => import("./pages/Settings"));
 const NotFound = lazy(() => import("./pages/NotFound"));
 
@@ -33,6 +34,7 @@ function Router() {
         <Route path="/template" component={TemplateManage} />
         <Route path="/wideface" component={WideFace} />
         <Route path="/process" component={ImageProcess} />
+        <Route path="/backup" component={BackupRestore} />
         <Route path="/settings" component={Settings} />
         <Route path="/404" component={NotFound} />
         {/* Final fallback route */}

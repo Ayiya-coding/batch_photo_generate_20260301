@@ -68,6 +68,7 @@ nul
 可行性分析/AccessKey.txt
 batch_photo_generate/
 *.md
+!README.md
 *.png
 *.jpg
 *.jpeg

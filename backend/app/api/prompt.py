@@ -10,6 +10,8 @@ from typing import Optional
 import asyncio
 import threading
 import logging
+from datetime import datetime, timezone
+import uuid
 
 try:
     import cv2
@@ -22,14 +24,21 @@ from app.core.database import get_db, SessionLocal
 from app.core.config import settings
 from app.core.settings_resolver import get_setting_value
 from app.core.constants import CROWD_TYPES, SINGLE_TYPES
-from app.schemas.common import PromptGenerateRequest, BaseResponse
-from app.models.database import BaseImage, PromptTemplate, GenerateTask, TemplateImage
+from app.schemas.common import (
+    PromptBulkUpsertRequest,
+    PromptGenerateRequest,
+    PromptLibraryImportRequest,
+    PromptTaskCreateRequest,
+    BaseResponse,
+)
+from app.models.database import Batch, BaseImage, PromptTemplate, GenerateTask, TemplateImage
 from app.services import progress_store as ps
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 TASK_TYPE = "prompt"
+PROMPT_LIBRARY_VERSION = "prompt-library.v1"
 
 
 def _summarize_reference_image(image_path: str) -> str:
@@ -128,6 +137,107 @@ def _build_task_negative_prompt(base_negative: str) -> str:
     )
     base = (base_negative or "").strip()
     return f"{base}, {extra}" if base else extra
+
+
+def _serialize_prompt_templates(templates: list[PromptTemplate]) -> list[dict]:
+    items: list[dict] = []
+    for row in templates:
+        items.append({
+            "id": row.id,
+            "crowd_type": row.crowd_type,
+            "style_name": row.style_name,
+            "positive_prompt": row.positive_prompt,
+            "negative_prompt": row.negative_prompt or "",
+            "reference_weight": row.reference_weight,
+            "preferred_engine": row.preferred_engine,
+            "is_active": bool(row.is_active),
+            "create_time": row.create_time,
+        })
+    return items
+
+
+def _resolve_strict_reference(db: Session, strict_reference: Optional[bool]) -> bool:
+    if strict_reference is not None:
+        return strict_reference
+    return str(get_setting_value(db, "generate_strict_reference", "1")).strip() == "1"
+
+
+def _create_tasks_from_templates(
+    db: Session,
+    batch_id: str,
+    templates: list[PromptTemplate],
+    clear_existing: bool = True,
+    strict_reference: Optional[bool] = None,
+) -> tuple[int, int]:
+    batch = db.query(Batch).filter(Batch.id == batch_id).first()
+    if not batch:
+        raise HTTPException(status_code=404, detail="批次不存在")
+
+    base_images = db.query(BaseImage).filter(
+        BaseImage.batch_id == batch_id,
+        BaseImage.status == "completed",
+    ).all()
+    if not base_images:
+        raise HTTPException(status_code=400, detail="当前批次没有已完成预处理的底图")
+
+    if not templates:
+        raise HTTPException(status_code=400, detail="当前词库为空，无法创建任务")
+
+    crowd_types = sorted({tmpl.crowd_type for tmpl in templates})
+    strict_mode = _resolve_strict_reference(db, strict_reference)
+    default_generate_engine = (
+        get_setting_value(db, "generate_engine", settings.IMAGE_GENERATION_ENGINE)
+        or settings.IMAGE_GENERATION_ENGINE
+    )
+
+    if clear_existing:
+        task_query = db.query(GenerateTask.id).join(BaseImage).filter(
+            BaseImage.batch_id == batch_id,
+        )
+        if crowd_types:
+            task_query = task_query.filter(GenerateTask.crowd_type.in_(crowd_types))
+        existing_task_ids = [row[0] for row in task_query.all()]
+        if existing_task_ids:
+            db.query(TemplateImage).filter(
+                TemplateImage.generate_task_id.in_(existing_task_ids)
+            ).delete(synchronize_session=False)
+            db.query(GenerateTask).filter(
+                GenerateTask.id.in_(existing_task_ids)
+            ).delete(synchronize_session=False)
+            db.flush()
+
+    existing_keys = {
+        (task.base_image_id, task.crowd_type, task.style_name)
+        for task in db.query(GenerateTask).join(BaseImage).filter(
+            BaseImage.batch_id == batch_id,
+        ).all()
+    }
+
+    tasks_created = 0
+    for img in base_images:
+        for tmpl in templates:
+            dedupe_key = (img.id, tmpl.crowd_type, tmpl.style_name)
+            if dedupe_key in existing_keys:
+                continue
+            db.add(GenerateTask(
+                id=str(uuid.uuid4()),
+                base_image_id=img.id,
+                crowd_type=tmpl.crowd_type,
+                style_name=tmpl.style_name,
+                prompt=_build_task_prompt(
+                    tmpl.positive_prompt,
+                    tmpl.style_name,
+                    strict_reference=strict_mode,
+                ),
+                negative_prompt=_build_task_negative_prompt(tmpl.negative_prompt or ""),
+                ai_engine=tmpl.preferred_engine or default_generate_engine,
+                status="pending",
+            ))
+            existing_keys.add(dedupe_key)
+            tasks_created += 1
+
+    db.commit()
+    return tasks_created, len(base_images)
 
 
 def _run_prompt_gen_background(
@@ -514,6 +624,207 @@ async def cancel_prompt_generation(batch_id: str):
     if ps.request_cancel(TASK_TYPE, batch_id, "用户请求中断提示词生成"):
         return BaseResponse(code=0, message="已发送中断请求，任务将在安全点停止")
     return BaseResponse(code=1, message="当前没有运行中的提示词任务")
+
+
+@router.post("/bulk-upsert", response_model=BaseResponse)
+async def bulk_upsert_prompts(
+    request: PromptBulkUpsertRequest,
+    db: Session = Depends(get_db),
+):
+    """按当前单个人群类型批量写入灵活导入的模板。"""
+    deduped = {item.style_name: item for item in request.items}
+    style_names = list(deduped.keys())
+    created_count = 0
+    updated_count = 0
+
+    if request.replace_current:
+        db.query(PromptTemplate).filter(
+            PromptTemplate.crowd_type == request.crowd_type,
+            PromptTemplate.is_active == True,
+        ).update({PromptTemplate.is_active: False}, synchronize_session=False)
+        db.flush()
+
+    existing_templates = db.query(PromptTemplate).filter(
+        PromptTemplate.crowd_type == request.crowd_type,
+        PromptTemplate.style_name.in_(style_names),
+    ).all()
+    existing_map = {template.style_name: template for template in existing_templates}
+
+    for style_name, item in deduped.items():
+        existing = existing_map.get(style_name)
+        if existing:
+            existing.positive_prompt = item.positive_prompt
+            existing.negative_prompt = item.negative_prompt or ""
+            existing.reference_weight = item.reference_weight
+            existing.preferred_engine = item.preferred_engine or "seedream"
+            existing.is_active = item.is_active
+            updated_count += 1
+            continue
+
+        db.add(PromptTemplate(
+            crowd_type=request.crowd_type,
+            style_name=item.style_name,
+            positive_prompt=item.positive_prompt,
+            negative_prompt=item.negative_prompt or "",
+            reference_weight=item.reference_weight,
+            preferred_engine=item.preferred_engine or "seedream",
+            is_active=item.is_active,
+        ))
+        created_count += 1
+
+    db.commit()
+    return BaseResponse(
+        code=0,
+        message=f"批量写入完成：新增 {created_count}，更新 {updated_count}",
+        data={
+            "crowd_type": request.crowd_type,
+            "created_count": created_count,
+            "updated_count": updated_count,
+            "total": len(deduped),
+        },
+    )
+
+
+@router.get("/export", response_model=BaseResponse)
+async def export_prompt_library(db: Session = Depends(get_db)):
+    """导出整个提示词词库（仅 active 条目）。"""
+    templates = db.query(PromptTemplate).filter(
+        PromptTemplate.is_active == True,
+    ).order_by(
+        PromptTemplate.crowd_type.asc(),
+        PromptTemplate.style_name.asc(),
+        PromptTemplate.create_time.asc(),
+    ).all()
+
+    prompts = _serialize_prompt_templates(templates)
+    return BaseResponse(
+        code=0,
+        message="提示词库导出成功",
+        data={
+            "version": PROMPT_LIBRARY_VERSION,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "app_name": settings.APP_NAME,
+            "prompts": prompts,
+            "summary": {
+                "prompt_count": len(prompts),
+                "crowd_type_count": len({item["crowd_type"] for item in prompts}),
+            },
+        },
+    )
+
+
+@router.post("/import", response_model=BaseResponse)
+async def import_prompt_library(
+    request: PromptLibraryImportRequest,
+    db: Session = Depends(get_db),
+):
+    """整库导入提示词，默认替换现有词库。"""
+    payload = request.library
+    if payload.version != PROMPT_LIBRARY_VERSION:
+        raise HTTPException(status_code=400, detail=f"不支持的词库版本: {payload.version}")
+
+    deduped: dict[tuple[str, str], object] = {}
+    for item in payload.prompts:
+        deduped[(item.crowd_type, item.style_name)] = item
+    items = list(deduped.values())
+
+    deleted_count = 0
+    updated_count = 0
+    created_count = 0
+
+    if request.replace_existing:
+        deleted_count = db.query(PromptTemplate).delete(synchronize_session=False)
+        db.flush()
+        for item in items:
+            db.add(PromptTemplate(
+                id=str(uuid.uuid4()),
+                crowd_type=item.crowd_type,
+                style_name=item.style_name,
+                positive_prompt=item.positive_prompt,
+                negative_prompt=item.negative_prompt or "",
+                reference_weight=item.reference_weight,
+                preferred_engine=item.preferred_engine or "seedream",
+                is_active=item.is_active,
+                create_time=item.create_time or datetime.now(timezone.utc),
+            ))
+            created_count += 1
+    else:
+        existing_map = {
+            (tmpl.crowd_type, tmpl.style_name): tmpl
+            for tmpl in db.query(PromptTemplate).all()
+        }
+        for item in items:
+            existing = existing_map.get((item.crowd_type, item.style_name))
+            if existing:
+                existing.positive_prompt = item.positive_prompt
+                existing.negative_prompt = item.negative_prompt or ""
+                existing.reference_weight = item.reference_weight
+                existing.preferred_engine = item.preferred_engine or "seedream"
+                existing.is_active = item.is_active
+                updated_count += 1
+            else:
+                db.add(PromptTemplate(
+                    id=str(uuid.uuid4()),
+                    crowd_type=item.crowd_type,
+                    style_name=item.style_name,
+                    positive_prompt=item.positive_prompt,
+                    negative_prompt=item.negative_prompt or "",
+                    reference_weight=item.reference_weight,
+                    preferred_engine=item.preferred_engine or "seedream",
+                    is_active=item.is_active,
+                    create_time=item.create_time or datetime.now(timezone.utc),
+                ))
+                created_count += 1
+
+    db.commit()
+
+    return BaseResponse(
+        code=0,
+        message=f"提示词库导入成功，共写入 {created_count + updated_count} 条",
+        data={
+            "replace_existing": request.replace_existing,
+            "deleted_count": deleted_count,
+            "created_count": created_count,
+            "updated_count": updated_count,
+            "prompt_count": len(items),
+        },
+    )
+
+
+@router.post("/create-tasks", response_model=BaseResponse)
+async def create_tasks_from_prompt_library(
+    request: PromptTaskCreateRequest,
+    db: Session = Depends(get_db),
+):
+    """按当前提示词词库为批次重建 GenerateTask。"""
+    query = db.query(PromptTemplate).filter(PromptTemplate.is_active == True)
+    if request.crowd_types:
+        query = query.filter(PromptTemplate.crowd_type.in_(request.crowd_types))
+    templates = query.order_by(
+        PromptTemplate.crowd_type.asc(),
+        PromptTemplate.style_name.asc(),
+        PromptTemplate.create_time.asc(),
+    ).all()
+
+    tasks_created, base_image_count = _create_tasks_from_templates(
+        db,
+        request.batch_id,
+        templates,
+        clear_existing=request.clear_existing,
+        strict_reference=request.strict_reference,
+    )
+
+    return BaseResponse(
+        code=0,
+        message=f"已按当前词库创建 {tasks_created} 个任务",
+        data={
+            "batch_id": request.batch_id,
+            "base_image_count": base_image_count,
+            "template_count": len(templates),
+            "pending_count": tasks_created,
+            "clear_existing": request.clear_existing,
+        },
+    )
 
 
 @router.get("/list", response_model=BaseResponse)
